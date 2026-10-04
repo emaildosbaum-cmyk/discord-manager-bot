@@ -3,10 +3,11 @@ import os
 import sys
 import json
 import logging
+import time
+import secrets
 import discord
 from discord import app_commands
 from discord.ext import commands
-import secrets
 import aiohttp
 from aiohttp import web
 
@@ -19,9 +20,47 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ojjfwxjirlttpxcjhlho.supabase.
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9qamZ3eGppcmx0dHB4Y2pobGhvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkyMjExMjcsImV4cCI6MjEwNDc5NzEyN30.QiBcBHLwS2yWbmgi_oAKSmRU1UEFNRXgfyLujmEK7XU")
 SUPABASE_TABLE = "discord_server_keys"
 
+# Histórico de Ações para Reversão (Undo / Rollback)
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_history.json")
+_server_history: dict[str, dict] = {}
+
+def load_history():
+    global _server_history
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                _server_history = json.load(f)
+    except Exception as e:
+        logger.warning(f"Erro ao carregar histórico: {e}")
+        _server_history = {}
+
+def save_history():
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(_server_history, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Erro ao salvar histórico: {e}")
+
+def record_last_action(guild_id: int, action_data: dict):
+    guild_key = str(guild_id)
+    _server_history[guild_key] = action_data
+    save_history()
+
+def get_last_action(guild_id: int) -> dict | None:
+    return _server_history.get(str(guild_id))
+
+def clear_last_action(guild_id: int):
+    guild_key = str(guild_id)
+    if guild_key in _server_history:
+        del _server_history[guild_key]
+        save_history()
+
+load_history()
+
 # Caches de sincronização em memória
 _sync_code_cache = {}        # guild_id_str -> sync_code
 _code_to_server_cache = {}   # sync_code -> guild_id_int
+
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 def get_token():
@@ -170,7 +209,7 @@ def build_overwrites(old_overwrites: dict, role_map: dict, target_guild: discord
     return new_overwrites
 
 
-async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord.Guild) -> tuple[dict, int]:
+async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord.Guild) -> tuple[dict, list[discord.Role]]:
     role_map = {source_guild.default_role: target_guild.default_role}
     try:
         await target_guild.default_role.edit(permissions=source_guild.default_role.permissions)
@@ -181,7 +220,7 @@ async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord
     roles.sort(key=lambda r: r.position)
     existing_roles = {r.name: r for r in target_guild.roles if not r.managed}
 
-    created_count = 0
+    created_roles = []
     for role in roles:
         try:
             if role.name in existing_roles:
@@ -197,15 +236,15 @@ async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord
                 reason=f"Clonado de {source_guild.name}"
             )
             role_map[role] = new_role
-            created_count += 1
+            created_roles.append(new_role)
             await asyncio.sleep(0.4)
         except Exception as e:
             logger.warning(f"Erro ao criar cargo {role.name}: {e}")
 
-    return role_map, created_count
+    return role_map, created_roles
 
 
-async def execute_clone_channels(source_guild: discord.Guild, target_guild: discord.Guild, role_map: dict = None) -> tuple[int, int]:
+async def execute_clone_channels(source_guild: discord.Guild, target_guild: discord.Guild, role_map: dict = None) -> tuple[list[discord.CategoryChannel], list[discord.abc.GuildChannel]]:
     if role_map is None:
         role_map = {source_guild.default_role: target_guild.default_role}
         target_roles = {r.name: r for r in target_guild.roles}
@@ -214,15 +253,15 @@ async def execute_clone_channels(source_guild: discord.Guild, target_guild: disc
                 role_map[r] = target_roles[r.name]
 
     cat_map = {}
-    categories_created = 0
-    channels_created = 0
+    created_categories = []
+    created_channels = []
 
     for cat in sorted(source_guild.categories, key=lambda c: c.position):
         try:
             overwrites = build_overwrites(cat.overwrites, role_map, target_guild)
             new_cat = await target_guild.create_category(name=cat.name, overwrites=overwrites)
             cat_map[cat.id] = new_cat
-            categories_created += 1
+            created_categories.append(new_cat)
             await asyncio.sleep(0.4)
         except Exception as e:
             logger.warning(f"Erro na categoria {cat.name}: {e}")
@@ -231,7 +270,7 @@ async def execute_clone_channels(source_guild: discord.Guild, target_guild: disc
         try:
             parent = cat_map.get(ch.category_id) if ch.category_id else None
             overwrites = build_overwrites(ch.overwrites, role_map, target_guild)
-            await target_guild.create_text_channel(
+            new_ch = await target_guild.create_text_channel(
                 name=ch.name,
                 category=parent,
                 topic=ch.topic,
@@ -239,7 +278,7 @@ async def execute_clone_channels(source_guild: discord.Guild, target_guild: disc
                 nsfw=ch.nsfw,
                 overwrites=overwrites
             )
-            channels_created += 1
+            created_channels.append(new_ch)
             await asyncio.sleep(0.4)
         except Exception as e:
             logger.warning(f"Erro no canal #{ch.name}: {e}")
@@ -249,38 +288,161 @@ async def execute_clone_channels(source_guild: discord.Guild, target_guild: disc
             parent = cat_map.get(vc.category_id) if vc.category_id else None
             overwrites = build_overwrites(vc.overwrites, role_map, target_guild)
             bitrate = min(vc.bitrate, int(target_guild.bitrate_limit))
-            await target_guild.create_voice_channel(
+            new_vc = await target_guild.create_voice_channel(
                 name=vc.name,
                 category=parent,
                 bitrate=bitrate,
                 user_limit=vc.user_limit,
                 overwrites=overwrites
             )
-            channels_created += 1
+            created_channels.append(new_vc)
             await asyncio.sleep(0.4)
         except Exception as e:
             logger.warning(f"Erro no canal de voz {vc.name}: {e}")
 
-    return categories_created, channels_created
+    return created_categories, created_channels
 
 
-async def execute_clone_emojis(source_guild: discord.Guild, target_guild: discord.Guild) -> int:
+async def execute_clone_emojis(source_guild: discord.Guild, target_guild: discord.Guild) -> list[discord.Emoji]:
     existing = {e.name for e in target_guild.emojis}
-    copied = 0
+    created_emojis = []
     for emoji in source_guild.emojis:
         if emoji.name in existing:
             continue
         try:
             img = await emoji.read()
-            await target_guild.create_custom_emoji(name=emoji.name, image=img)
-            copied += 1
+            new_emoji = await target_guild.create_custom_emoji(name=emoji.name, image=img)
+            created_emojis.append(new_emoji)
             await asyncio.sleep(0.5)
         except discord.HTTPException as e:
             if e.code == 30008:
                 break
         except Exception:
             pass
-    return copied
+    return created_emojis
+
+
+async def execute_revert_action(guild: discord.Guild, action: dict) -> tuple[bool, str]:
+    """Executa a reversão completa da ação com base no histórico."""
+    act_type = action.get("type")
+
+    # 1. Reverter clonagens (apagar o que foi criado)
+    if act_type in ("clonar_tudo", "clonar_cargos", "clonar_canais", "clonar_emojis"):
+        del_emojis = 0
+        del_channels = 0
+        del_cats = 0
+        del_roles = 0
+
+        # Emojis criados
+        for e_id in action.get("created_emoji_ids", []):
+            emoji = guild.get_emoji(e_id)
+            if emoji:
+                try:
+                    await emoji.delete(reason="Reversão de comando ServerManager")
+                    del_emojis += 1
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+
+        # Canais criados
+        for ch_id in action.get("created_channel_ids", []):
+            ch = guild.get_channel(ch_id)
+            if ch:
+                try:
+                    await ch.delete(reason="Reversão de comando ServerManager")
+                    del_channels += 1
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+
+        # Categorias criadas
+        for cat_id in action.get("created_category_ids", []):
+            cat = guild.get_channel(cat_id)
+            if cat:
+                try:
+                    await cat.delete(reason="Reversão de comando ServerManager")
+                    del_cats += 1
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+
+        # Cargos criados
+        for r_id in action.get("created_role_ids", []):
+            role = guild.get_role(r_id)
+            if role:
+                try:
+                    await role.delete(reason="Reversão de comando ServerManager")
+                    del_roles += 1
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+
+        report = []
+        if del_roles > 0:
+            report.append(f"• {del_roles} Cargos removidos")
+        if del_cats > 0:
+            report.append(f"• {del_cats} Categorias removidas")
+        if del_channels > 0:
+            report.append(f"• {del_channels} Canais removidos")
+        if del_emojis > 0:
+            report.append(f"• {del_emojis} Emojis removidos")
+
+        summary = "\n".join(report) if report else "Nenhum dos itens criados foi localizado (podem já ter sido apagados)."
+        return True, f"⏪ **Reversão de Clonagem Concluída com Sucesso!**\n{summary}"
+
+    # 2. Reverter reset de cargos (restaurar os cargos a partir do snapshot)
+    elif act_type == "limpar_cargos":
+        roles_data = action.get("snapshot_roles", [])
+        restored = 0
+        for r_info in roles_data:
+            try:
+                perms = discord.Permissions(r_info.get("permissions", 0))
+                color = discord.Color(r_info.get("color", 0))
+                await guild.create_role(
+                    name=r_info["name"],
+                    permissions=perms,
+                    color=color,
+                    hoist=r_info.get("hoist", False),
+                    mentionable=r_info.get("mentionable", False),
+                    reason="Reversão do reset de cargos"
+                )
+                restored += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.warning(f"Erro ao restaurar cargo {r_info.get('name')}: {e}")
+        return True, f"⏪ **Reversão Concluída!**\n• {restored} de {len(roles_data)} cargos foram restaurados com sucesso."
+
+    # 3. Reverter exclusão de canais / categoria
+    elif act_type in ("limpar_canais", "apagar_categoria"):
+        channels_data = action.get("snapshot_channels") or action.get("snapshot_category", {}).get("channels", [])
+        cat_name = action.get("snapshot_category", {}).get("name")
+        restored_cat = 0
+        restored_ch = 0
+
+        target_cat = None
+        if cat_name:
+            try:
+                target_cat = await guild.create_category(name=cat_name, reason="Reversão de exclusão de categoria")
+                restored_cat += 1
+            except Exception:
+                pass
+
+        for ch_info in channels_data:
+            try:
+                ch_type = ch_info.get("type", "voice" if ch_info.get("type") == "voice" else "text")
+                parent = target_cat
+                if ch_type == "voice":
+                    await guild.create_voice_channel(name=ch_info["name"], category=parent, reason="Reversão de canais")
+                else:
+                    await guild.create_text_channel(name=ch_info["name"], category=parent, topic=ch_info.get("topic"), reason="Reversão de canais")
+                restored_ch += 1
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+        return True, f"⏪ **Reversão Concluída!**\n• {restored_ch} canais restaurados."
+
+    return False, "Tipo de ação desconhecido para reversão."
+
 
 
 async def get_owner_display(guild: discord.Guild) -> str:
@@ -496,6 +658,7 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
         name="📜 Comandos (Prefix ! ou Barra /)",
         value=(
             "• `/setup` ou `!setup` — Mostra este painel\n"
+            "• `/reverter` ou `!reverter` — ⏪ Desfaz a última clonagem/ação\n"
             "• `/gerar_id` ou `!gerar_id` — Gera um novo código secreto\n"
             "• `!sync` — Força registro imediato dos comandos /\n"
             "• `/clonar_tudo <código>` — Clona tudo (exige código secreto)\n"
@@ -571,12 +734,29 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
 
     if view.value:
         msg = await interaction.followup.send("🚀 [1/3] Iniciando clonagem de cargos...", ephemeral=True)
-        role_map, roles_cnt = await execute_clone_roles(source_guild, target_guild)
+        role_map, created_roles = await execute_clone_roles(source_guild, target_guild)
+        roles_cnt = len(created_roles)
         await msg.edit(content=f"✅ Cargos clonados ({roles_cnt}).\n🚀 [2/3] Clonando categorias e canais...")
-        cats_cnt, chs_cnt = await execute_clone_channels(source_guild, target_guild, role_map)
+        created_cats, created_chs = await execute_clone_channels(source_guild, target_guild, role_map)
+        cats_cnt = len(created_cats)
+        chs_cnt = len(created_chs)
         await msg.edit(content=f"✅ Cargos ({roles_cnt}) e Canais ({chs_cnt}) clonados.\n🚀 [3/3] Clonando emojis...")
-        emojis_cnt = await execute_clone_emojis(source_guild, target_guild)
-        await msg.edit(content=f"🎉 **Clonagem Completa Concluída!**\n• {roles_cnt} Cargos\n• {cats_cnt} Categorias\n• {chs_cnt} Canais\n• {emojis_cnt} Emojis")
+        created_emojis = await execute_clone_emojis(source_guild, target_guild)
+        emojis_cnt = len(created_emojis)
+
+        record_last_action(target_guild.id, {
+            "type": "clonar_tudo",
+            "name": f"Clonagem Completa (de {source_guild.name})",
+            "details": f"{roles_cnt} Cargos, {cats_cnt} Categorias, {chs_cnt} Canais, {emojis_cnt} Emojis",
+            "created_role_ids": [r.id for r in created_roles],
+            "created_category_ids": [c.id for c in created_cats],
+            "created_channel_ids": [c.id for c in created_chs],
+            "created_emoji_ids": [e.id for e in created_emojis],
+            "timestamp": time.time(),
+            "author_id": interaction.user.id
+        })
+
+        await msg.edit(content=f"🎉 **Clonagem Completa Concluída!**\n• {roles_cnt} Cargos\n• {cats_cnt} Categorias\n• {chs_cnt} Canais\n• {emojis_cnt} Emojis\n\n💡 *Dica: Se precisar desfazer tudo, use `/reverter` ou `!reverter`.*")
 
 
 @bot.tree.command(name="clonar_cargos", description="Clona APENAS os cargos de outro servidor.")
@@ -591,8 +771,19 @@ async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
         return await interaction.response.send_message(f"❌ {err_msg}", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
-    _, roles_cnt = await execute_clone_roles(source_guild, interaction.guild)
-    await interaction.followup.send(f"✅ **Sucesso:** {roles_cnt} cargos clonados de **{source_guild.name}**!", ephemeral=True)
+    _, created_roles = await execute_clone_roles(source_guild, interaction.guild)
+    roles_cnt = len(created_roles)
+
+    record_last_action(interaction.guild.id, {
+        "type": "clonar_cargos",
+        "name": f"Clonagem de Cargos (de {source_guild.name})",
+        "details": f"{roles_cnt} Cargos",
+        "created_role_ids": [r.id for r in created_roles],
+        "timestamp": time.time(),
+        "author_id": interaction.user.id
+    })
+
+    await interaction.followup.send(f"✅ **Sucesso:** {roles_cnt} cargos clonados de **{source_guild.name}**!\n💡 *Use `/reverter` para desfazer se desejar.*", ephemeral=True)
 
 
 @bot.tree.command(name="clonar_canais", description="Clona APENAS as categorias e canais de outro servidor.")
@@ -607,8 +798,21 @@ async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
         return await interaction.response.send_message(f"❌ {err_msg}", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
-    cats_cnt, chs_cnt = await execute_clone_channels(source_guild, interaction.guild)
-    await interaction.followup.send(f"✅ **Sucesso:** {cats_cnt} categorias e {chs_cnt} canais clonados de **{source_guild.name}**!", ephemeral=True)
+    created_cats, created_chs = await execute_clone_channels(source_guild, interaction.guild)
+    cats_cnt = len(created_cats)
+    chs_cnt = len(created_chs)
+
+    record_last_action(interaction.guild.id, {
+        "type": "clonar_canais",
+        "name": f"Clonagem de Canais (de {source_guild.name})",
+        "details": f"{cats_cnt} Categorias, {chs_cnt} Canais",
+        "created_category_ids": [c.id for c in created_cats],
+        "created_channel_ids": [c.id for c in created_chs],
+        "timestamp": time.time(),
+        "author_id": interaction.user.id
+    })
+
+    await interaction.followup.send(f"✅ **Sucesso:** {cats_cnt} categorias e {chs_cnt} canais clonados de **{source_guild.name}**!\n💡 *Use `/reverter` para desfazer se desejar.*", ephemeral=True)
 
 
 @bot.tree.command(name="clonar_emojis", description="Clona os emojis de outro servidor.")
@@ -623,8 +827,19 @@ async def cmd_clonar_emojis(interaction: discord.Interaction, id_origem: str):
         return await interaction.response.send_message(f"❌ {err_msg}", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
-    count = await execute_clone_emojis(source_guild, interaction.guild)
-    await interaction.followup.send(f"✅ **Sucesso:** {count} emojis copiados de **{source_guild.name}**!", ephemeral=True)
+    created_emojis = await execute_clone_emojis(source_guild, interaction.guild)
+    count = len(created_emojis)
+
+    record_last_action(interaction.guild.id, {
+        "type": "clonar_emojis",
+        "name": f"Clonagem de Emojis (de {source_guild.name})",
+        "details": f"{count} Emojis",
+        "created_emoji_ids": [e.id for e in created_emojis],
+        "timestamp": time.time(),
+        "author_id": interaction.user.id
+    })
+
+    await interaction.followup.send(f"✅ **Sucesso:** {count} emojis copiados de **{source_guild.name}**!\n💡 *Use `/reverter` para desfazer se desejar.*", ephemeral=True)
 
 
 @bot.tree.command(name="apagar_categoria", description="Apaga uma categoria inteira e todos os canais contidos nela.")
@@ -646,6 +861,12 @@ async def cmd_apagar_categoria(interaction: discord.Interaction, categoria: disc
     await view.wait()
 
     if view.value:
+        snapshot_chs = [
+            {"name": ch.name, "type": "voice" if isinstance(ch, discord.VoiceChannel) else "text", "topic": getattr(ch, "topic", None)}
+            for ch in categoria.channels
+        ]
+        cat_name = categoria.name
+
         msg = await interaction.followup.send("🗑️ Apagando canais da categoria...", ephemeral=True)
         for ch in list(categoria.channels):
             try:
@@ -659,7 +880,19 @@ async def cmd_apagar_categoria(interaction: discord.Interaction, categoria: disc
         except Exception:
             pass
 
-        await msg.edit(content=f"✅ Categoria **{categoria.name}** e todos os seus {channels_count} canais foram apagados!")
+        record_last_action(interaction.guild.id, {
+            "type": "apagar_categoria",
+            "name": f"Exclusão da Categoria {cat_name}",
+            "details": f"Categoria '{cat_name}' e {len(snapshot_chs)} canais",
+            "snapshot_category": {
+                "name": cat_name,
+                "channels": snapshot_chs
+            },
+            "timestamp": time.time(),
+            "author_id": interaction.user.id
+        })
+
+        await msg.edit(content=f"✅ Categoria **{cat_name}** e todos os seus {channels_count} canais foram apagados!\n💡 *Use `/reverter` para restaurar se necessário.*")
 
 
 @bot.tree.command(name="limpar_canais", description="🚨 Reseta o servidor: Apaga TODOS os canais existentes.")
@@ -673,13 +906,22 @@ async def cmd_limpar_canais(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"🚨 **PERIGO MÁXIMO:** Você está prestes a apagar **TODOS OS {len(guild.channels)} CANAIS** de **{guild.name}**!\n"
-        f"Esta ação não pode ser desfeita.",
+        f"Esta ação pode ser desfeita usando `/reverter` logo em seguida.",
         view=view,
         ephemeral=True
     )
     await view.wait()
 
     if view.value:
+        snapshot_chs = [
+            {
+                "name": ch.name,
+                "type": "voice" if isinstance(ch, discord.VoiceChannel) else "text",
+                "topic": getattr(ch, "topic", None)
+            }
+            for ch in guild.channels
+        ]
+
         temp_ch = await guild.create_text_channel(name="suporte-reset", reason="Canal temporário durante reset")
         for ch in list(guild.channels):
             if ch.id == temp_ch.id:
@@ -689,7 +931,17 @@ async def cmd_limpar_canais(interaction: discord.Interaction):
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
-        await temp_ch.send("✅ **Reset de canais concluído!** Apenas este canal foi mantido para você continuar.")
+
+        record_last_action(guild.id, {
+            "type": "limpar_canais",
+            "name": "Reset Geral de Canais",
+            "details": f"{len(snapshot_chs)} Canais excluídos",
+            "snapshot_channels": snapshot_chs,
+            "timestamp": time.time(),
+            "author_id": interaction.user.id
+        })
+
+        await temp_ch.send("✅ **Reset de canais concluído!** Apenas este canal foi mantido para você continuar.\n💡 *Use `/reverter` caso deseje restaurar os canais antigos.*")
 
 
 @bot.tree.command(name="limpar_cargos", description="🚨 Apaga todos os cargos personalizados do servidor.")
@@ -710,6 +962,17 @@ async def cmd_limpar_cargos(interaction: discord.Interaction):
     await view.wait()
 
     if view.value:
+        snapshot_roles = [
+            {
+                "name": r.name,
+                "permissions": r.permissions.value,
+                "color": r.color.value,
+                "hoist": r.hoist,
+                "mentionable": r.mentionable
+            }
+            for r in roles
+        ]
+
         deleted = 0
         for r in roles:
             try:
@@ -718,7 +981,57 @@ async def cmd_limpar_cargos(interaction: discord.Interaction):
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
-        await interaction.followup.send(f"✅ Reset concluído! {deleted} cargos foram excluídos.", ephemeral=True)
+
+        record_last_action(guild.id, {
+            "type": "limpar_cargos",
+            "name": "Reset de Cargos",
+            "details": f"{deleted} Cargos excluídos",
+            "snapshot_roles": snapshot_roles,
+            "timestamp": time.time(),
+            "author_id": interaction.user.id
+        })
+
+        await interaction.followup.send(f"✅ Reset concluído! {deleted} cargos foram excluídos.\n💡 *Use `/reverter` para restaurá-los se desejar.*", ephemeral=True)
+
+
+@bot.tree.command(name="reverter", description="Reverte a última ação executada no servidor (ex: desfaz clonagens ou exclusões).")
+@app_commands.default_permissions(administrator=True)
+async def cmd_reverter(interaction: discord.Interaction):
+    if not await check_admin_permission(interaction):
+        return
+
+    action = get_last_action(interaction.guild_id)
+    if not action:
+        return await interaction.response.send_message(
+            "ℹ️ **Nenhuma ação recente registrada para reverter neste servidor.**\n"
+            "O histórico registra comandos executados como `/clonar_tudo`, `/clonar_cargos`, `/clonar_canais`, `/clonar_emojis`, etc.",
+            ephemeral=True
+        )
+
+    elapsed = int(time.time() - action.get("timestamp", time.time()))
+    mins = elapsed // 60
+    time_str = f"há {mins} minuto(s)" if mins > 0 else "há poucos segundos"
+    author_str = f"<@{action.get('author_id')}>" if action.get("author_id") else "Administrador"
+
+    view = ConfirmDangerAction(interaction.user.id, "Reverter Ação")
+    await interaction.response.send_message(
+        f"⏪ **Reverter Última Ação do Servidor**\n\n"
+        f"• **Ação:** {action.get('name', 'Comando')}\n"
+        f"• **Detalhes:** {action.get('details', 'N/A')}\n"
+        f"• **Executado por:** {author_str} ({time_str})\n\n"
+        f"⚠️ **Confirmação:** Deseja desfazer e reverter esta ação agora?",
+        view=view,
+        ephemeral=True
+    )
+    await view.wait()
+
+    if view.value:
+        msg = await interaction.followup.send("⏳ Processando reversão do comando...", ephemeral=True)
+        success, result_text = await execute_revert_action(interaction.guild, action)
+        if success:
+            clear_last_action(interaction.guild_id)
+        await msg.edit(content=result_text)
+
 
 
 # =====================================================================
@@ -775,10 +1088,27 @@ async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None):
         return await ctx.reply(f"❌ {err_msg}")
 
     msg = await ctx.reply(f"🚀 Iniciando clonagem completa de **{source_guild.name}**...")
-    role_map, roles_cnt = await execute_clone_roles(source_guild, ctx.guild)
-    cats_cnt, chs_cnt = await execute_clone_channels(source_guild, ctx.guild, role_map)
-    emojis_cnt = await execute_clone_emojis(source_guild, ctx.guild)
-    await msg.edit(content=f"🎉 **Clonagem Concluída!**\n• {roles_cnt} Cargos\n• {cats_cnt} Categorias\n• {chs_cnt} Canais\n• {emojis_cnt} Emojis")
+    role_map, created_roles = await execute_clone_roles(source_guild, ctx.guild)
+    roles_cnt = len(created_roles)
+    created_cats, created_chs = await execute_clone_channels(source_guild, ctx.guild, role_map)
+    cats_cnt = len(created_cats)
+    chs_cnt = len(created_chs)
+    created_emojis = await execute_clone_emojis(source_guild, ctx.guild)
+    emojis_cnt = len(created_emojis)
+
+    record_last_action(ctx.guild.id, {
+        "type": "clonar_tudo",
+        "name": f"Clonagem Completa (de {source_guild.name})",
+        "details": f"{roles_cnt} Cargos, {cats_cnt} Categorias, {chs_cnt} Canais, {emojis_cnt} Emojis",
+        "created_role_ids": [r.id for r in created_roles],
+        "created_category_ids": [c.id for c in created_cats],
+        "created_channel_ids": [c.id for c in created_chs],
+        "created_emoji_ids": [e.id for e in created_emojis],
+        "timestamp": time.time(),
+        "author_id": ctx.author.id
+    })
+
+    await msg.edit(content=f"🎉 **Clonagem Concluída!**\n• {roles_cnt} Cargos\n• {cats_cnt} Categorias\n• {chs_cnt} Canais\n• {emojis_cnt} Emojis\n\n💡 *Dica: Se precisar desfazer, use `!reverter` ou `/reverter`.*")
 
 
 @bot.command(name="clonar_cargos")
@@ -793,8 +1123,19 @@ async def prefix_clonar_cargos(ctx: commands.Context, id_origem: str = None):
         return await ctx.reply(f"❌ {err_msg}")
 
     msg = await ctx.reply(f"🚀 Clonando cargos de **{source_guild.name}**...")
-    _, roles_cnt = await execute_clone_roles(source_guild, ctx.guild)
-    await msg.edit(content=f"✅ Sucesso! {roles_cnt} cargos clonados de **{source_guild.name}**.")
+    _, created_roles = await execute_clone_roles(source_guild, ctx.guild)
+    roles_cnt = len(created_roles)
+
+    record_last_action(ctx.guild.id, {
+        "type": "clonar_cargos",
+        "name": f"Clonagem de Cargos (de {source_guild.name})",
+        "details": f"{roles_cnt} Cargos",
+        "created_role_ids": [r.id for r in created_roles],
+        "timestamp": time.time(),
+        "author_id": ctx.author.id
+    })
+
+    await msg.edit(content=f"✅ Sucesso! {roles_cnt} cargos clonados de **{source_guild.name}**.\n💡 *Use `!reverter` para desfazer se desejar.*")
 
 
 @bot.command(name="clonar_canais")
@@ -809,8 +1150,21 @@ async def prefix_clonar_canais(ctx: commands.Context, id_origem: str = None):
         return await ctx.reply(f"❌ {err_msg}")
 
     msg = await ctx.reply(f"🚀 Clonando canais de **{source_guild.name}**...")
-    cats_cnt, chs_cnt = await execute_clone_channels(source_guild, ctx.guild)
-    await msg.edit(content=f"✅ Sucesso! {cats_cnt} categorias e {chs_cnt} canais clonados.")
+    created_cats, created_chs = await execute_clone_channels(source_guild, ctx.guild)
+    cats_cnt = len(created_cats)
+    chs_cnt = len(created_chs)
+
+    record_last_action(ctx.guild.id, {
+        "type": "clonar_canais",
+        "name": f"Clonagem de Canais (de {source_guild.name})",
+        "details": f"{cats_cnt} Categorias, {chs_cnt} Canais",
+        "created_category_ids": [c.id for c in created_cats],
+        "created_channel_ids": [c.id for c in created_chs],
+        "timestamp": time.time(),
+        "author_id": ctx.author.id
+    })
+
+    await msg.edit(content=f"✅ Sucesso! {cats_cnt} categorias e {chs_cnt} canais clonados.\n💡 *Use `!reverter` para desfazer se desejar.*")
 
 
 @bot.command(name="clonar_emojis")
@@ -825,8 +1179,19 @@ async def prefix_clonar_emojis(ctx: commands.Context, id_origem: str = None):
         return await ctx.reply(f"❌ {err_msg}")
 
     msg = await ctx.reply(f"🚀 Clonando emojis de **{source_guild.name}**...")
-    count = await execute_clone_emojis(source_guild, ctx.guild)
-    await msg.edit(content=f"✅ Sucesso! {count} emojis copiados.")
+    created_emojis = await execute_clone_emojis(source_guild, ctx.guild)
+    count = len(created_emojis)
+
+    record_last_action(ctx.guild.id, {
+        "type": "clonar_emojis",
+        "name": f"Clonagem de Emojis (de {source_guild.name})",
+        "details": f"{count} Emojis",
+        "created_emoji_ids": [e.id for e in created_emojis],
+        "timestamp": time.time(),
+        "author_id": ctx.author.id
+    })
+
+    await msg.edit(content=f"✅ Sucesso! {count} emojis copiados.\n💡 *Use `!reverter` para desfazer se desejar.*")
 
 
 @bot.command(name="apagar_categoria")
@@ -846,6 +1211,12 @@ async def prefix_apagar_categoria(ctx: commands.Context, *, nome_ou_id: str = No
         return await ctx.reply("❌ Categoria não encontrada.")
 
     channels_count = len(cat_target.channels)
+    snapshot_chs = [
+        {"name": ch.name, "type": "voice" if isinstance(ch, discord.VoiceChannel) else "text", "topic": getattr(ch, "topic", None)}
+        for ch in cat_target.channels
+    ]
+    cat_name = cat_target.name
+
     msg = await ctx.reply(f"🗑️ Apagando categoria '{cat_target.name}' e seus {channels_count} canais...")
     for ch in list(cat_target.channels):
         try:
@@ -859,7 +1230,19 @@ async def prefix_apagar_categoria(ctx: commands.Context, *, nome_ou_id: str = No
     except Exception:
         pass
 
-    await msg.edit(content=f"✅ Categoria **{cat_target.name}** e todos os seus {channels_count} canais foram apagados!")
+    record_last_action(ctx.guild.id, {
+        "type": "apagar_categoria",
+        "name": f"Exclusão da Categoria {cat_name}",
+        "details": f"Categoria '{cat_name}' e {len(snapshot_chs)} canais",
+        "snapshot_category": {
+            "name": cat_name,
+            "channels": snapshot_chs
+        },
+        "timestamp": time.time(),
+        "author_id": ctx.author.id
+    })
+
+    await msg.edit(content=f"✅ Categoria **{cat_name}** e todos os seus {channels_count} canais foram apagados!\n💡 *Use `!reverter` para restaurá-los se necessário.*")
 
 
 @bot.command(name="limpar_canais")
@@ -872,6 +1255,15 @@ async def prefix_limpar_canais(ctx: commands.Context):
     await view.wait()
 
     if view.value:
+        snapshot_chs = [
+            {
+                "name": ch.name,
+                "type": "voice" if isinstance(ch, discord.VoiceChannel) else "text",
+                "topic": getattr(ch, "topic", None)
+            }
+            for ch in ctx.guild.channels
+        ]
+
         temp_ch = await ctx.guild.create_text_channel(name="suporte-reset", reason="Canal temporário durante reset")
         for ch in list(ctx.guild.channels):
             if ch.id == temp_ch.id:
@@ -881,7 +1273,17 @@ async def prefix_limpar_canais(ctx: commands.Context):
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
-        await temp_ch.send("✅ **Reset de canais concluído!** Apenas este canal foi mantido para você continuar.")
+
+        record_last_action(ctx.guild.id, {
+            "type": "limpar_canais",
+            "name": "Reset Geral de Canais",
+            "details": f"{len(snapshot_chs)} Canais excluídos",
+            "snapshot_channels": snapshot_chs,
+            "timestamp": time.time(),
+            "author_id": ctx.author.id
+        })
+
+        await temp_ch.send("✅ **Reset de canais concluído!** Apenas este canal foi mantido para você continuar.\n💡 *Use `!reverter` caso deseje restaurar os canais antigos.*")
 
 
 @bot.command(name="limpar_cargos")
@@ -895,6 +1297,17 @@ async def prefix_limpar_cargos(ctx: commands.Context):
     await view.wait()
 
     if view.value:
+        snapshot_roles = [
+            {
+                "name": r.name,
+                "permissions": r.permissions.value,
+                "color": r.color.value,
+                "hoist": r.hoist,
+                "mentionable": r.mentionable
+            }
+            for r in roles
+        ]
+
         deleted = 0
         for r in roles:
             try:
@@ -903,7 +1316,55 @@ async def prefix_limpar_cargos(ctx: commands.Context):
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
-        await ctx.reply(f"✅ Reset concluído! {deleted} cargos foram excluídos.")
+
+        record_last_action(ctx.guild.id, {
+            "type": "limpar_cargos",
+            "name": "Reset de Cargos",
+            "details": f"{deleted} Cargos excluídos",
+            "snapshot_roles": snapshot_roles,
+            "timestamp": time.time(),
+            "author_id": ctx.author.id
+        })
+
+        await ctx.reply(f"✅ Reset concluído! {deleted} cargos foram excluídos.\n💡 *Use `!reverter` para restaurá-los se desejar.*")
+
+
+@bot.command(name="reverter")
+async def prefix_reverter(ctx: commands.Context):
+    """Reverte a última ação executada no servidor via !reverter."""
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado. Apenas o Dono ou Administradores podem usar.")
+
+    action = get_last_action(ctx.guild.id)
+    if not action:
+        return await ctx.reply(
+            "ℹ️ **Nenhuma ação recente registrada para reverter neste servidor.**\n"
+            "O histórico registra comandos executados como `!clonar_tudo`, `!clonar_cargos`, etc."
+        )
+
+    elapsed = int(time.time() - action.get("timestamp", time.time()))
+    mins = elapsed // 60
+    time_str = f"há {mins} minuto(s)" if mins > 0 else "há poucos segundos"
+    author_str = f"<@{action.get('author_id')}>" if action.get("author_id") else "Administrador"
+
+    view = ConfirmDangerAction(ctx.author.id, "Reverter Ação")
+    confirm_msg = await ctx.reply(
+        f"⏪ **Reverter Última Ação do Servidor**\n\n"
+        f"• **Ação:** {action.get('name', 'Comando')}\n"
+        f"• **Detalhes:** {action.get('details', 'N/A')}\n"
+        f"• **Executado por:** {author_str} ({time_str})\n\n"
+        f"⚠️ **Confirmação:** Deseja desfazer e reverter esta ação agora?",
+        view=view
+    )
+    await view.wait()
+
+    if view.value:
+        progress_msg = await ctx.reply("⏳ Processando reversão do comando...")
+        success, result_text = await execute_revert_action(ctx.guild, action)
+        if success:
+            clear_last_action(ctx.guild.id)
+        await progress_msg.edit(content=result_text)
+
 
 
 # =====================================================================
