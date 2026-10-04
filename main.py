@@ -87,15 +87,24 @@ def is_authorized_admin(interaction_or_ctx) -> bool:
         return False
 
     # 1. O dono do servidor tem bypass absoluto
-    if user.id == guild.owner_id:
+    if getattr(guild, "owner_id", None) and user.id == guild.owner_id:
         return True
 
     # 2. Dono da aplicação / bot
-    if bot.owner_id and user.id == bot.owner_id:
+    if getattr(bot, "owner_id", None) and user.id == bot.owner_id:
+        return True
+    if getattr(bot, "owner_ids", None) and user.id in bot.owner_ids:
         return True
 
+    # Se user não tiver guild_permissions diretamente, tenta obter o membro no servidor
+    member = user
+    if not hasattr(member, "guild_permissions") and hasattr(guild, "get_member"):
+        m = guild.get_member(user.id)
+        if m:
+            member = m
+
     # 3. Permissões de administrador no membro
-    guild_perms = getattr(user, "guild_permissions", None)
+    guild_perms = getattr(member, "guild_permissions", None)
     if guild_perms and getattr(guild_perms, "administrator", False):
         return True
 
@@ -466,6 +475,13 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
         description="Sistema de gerenciamento e clonagem de servidor ativo e 100% isolado.",
         color=0x335FFF
     )
+
+    # Exibe o avatar oficial do bot no thumbnail e autor
+    if bot.user and hasattr(bot.user, "display_avatar"):
+        avatar_url = bot.user.display_avatar.url
+        embed.set_thumbnail(url=avatar_url)
+        embed.set_author(name="ServerManager", icon_url=avatar_url)
+
     embed.add_field(name="📍 Servidor Atual", value=f"**{guild.name}** (`{guild.id}`)", inline=False)
     embed.add_field(
         name="🔑 Código Privado de Clonagem",
@@ -477,7 +493,7 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="📶 Posição no Topo", value="✅ No Topo dos Cargos" if is_top else "⚠️ Suba o cargo do bot para o topo!", inline=True)
 
     embed.add_field(
-        name="📜 Comandos (Prefix ou Barra /)",
+        name="📜 Comandos (Prefix ! ou Barra /)",
         value=(
             "• `/setup` ou `!setup` — Mostra este painel\n"
             "• `/gerar_id` ou `!gerar_id` — Gera um novo código secreto\n"
@@ -492,7 +508,10 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
         ),
         inline=False
     )
-    embed.set_footer(text="Privacidade Ativa: Nenhum outro servidor conectado é revelado.")
+    if guild.icon:
+        embed.set_footer(text=f"Servidor: {guild.name} • Privacidade Ativa", icon_url=guild.icon.url)
+    else:
+        embed.set_footer(text="Privacidade Ativa: Nenhum outro servidor conectado é revelado.")
     return embed
 
 
@@ -524,7 +543,7 @@ async def cmd_gerar_id(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="clonar_tudo", description="Clona cargos, categorias, canais e emojis de outro servidor.")
-@app_commands.describe(id_origem="Código secreto do servidor de onde você quer copiar (ex: SRV-XXXXXX)")
+@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de onde você quer copiar")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
@@ -561,7 +580,7 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_cargos", description="Clona APENAS os cargos de outro servidor.")
-@app_commands.describe(id_origem="Código secreto do servidor de origem (ex: SRV-XXXXXX)")
+@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
@@ -577,7 +596,7 @@ async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_canais", description="Clona APENAS as categorias e canais de outro servidor.")
-@app_commands.describe(id_origem="Código secreto do servidor de origem (ex: SRV-XXXXXX)")
+@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
@@ -593,7 +612,7 @@ async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_emojis", description="Clona os emojis de outro servidor.")
-@app_commands.describe(id_origem="Código secreto do servidor de origem (ex: SRV-XXXXXX)")
+@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_emojis(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
@@ -745,11 +764,11 @@ async def prefix_sync(ctx: commands.Context):
 
 @bot.command(name="clonar_tudo")
 async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None):
-    """Clona tudo via comando de prefixo !clonar_tudo <código secreto>."""
+    """Clona tudo via comando de prefixo !clonar_tudo <id ou código>."""
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_tudo <código_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_tudo <código ou id_do_servidor_origem>`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
@@ -767,7 +786,7 @@ async def prefix_clonar_cargos(ctx: commands.Context, id_origem: str = None):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_cargos <código_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_cargos <código ou id_do_servidor_origem>`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
@@ -783,7 +802,7 @@ async def prefix_clonar_canais(ctx: commands.Context, id_origem: str = None):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_canais <código_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_canais <código ou id_do_servidor_origem>`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
@@ -799,7 +818,7 @@ async def prefix_clonar_emojis(ctx: commands.Context, id_origem: str = None):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_emojis <código_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_emojis <código ou id_do_servidor_origem>`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
@@ -879,7 +898,7 @@ async def prefix_limpar_cargos(ctx: commands.Context):
         deleted = 0
         for r in roles:
             try:
-                await r.delete(reason="Reset geral de cargos")
+                await r.delete(reason="Reset de cargos solicitado por administrador")
                 deleted += 1
                 await asyncio.sleep(0.3)
             except Exception:
@@ -942,7 +961,7 @@ async def start_web_server():
 async def on_ready():
     logger.info(f"Bot conectado como {bot.user} (ID: {bot.user.id})")
 
-    # Sincroniza os comandos Slash em cada servidor individualmente
+    # Sincroniza os comandos Slash em cada servidor e destaca cargo no tab
     for guild in bot.guilds:
         try:
             bot.tree.copy_global_to(guild=guild)
@@ -950,6 +969,16 @@ async def on_ready():
             logger.info(f"Comandos sincronizados no servidor: {guild.name}")
         except Exception as e:
             logger.warning(f"Erro ao sincronizar na guild {guild.name}: {e}")
+
+        # Tenta exibir o cargo do bot destacado no tab (hoist=True)
+        try:
+            bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+            if bot_member and bot_member.guild_permissions.manage_roles:
+                top_r = bot_member.top_role
+                if top_r and not top_r.is_default() and not top_r.hoist:
+                    await top_r.edit(hoist=True, reason="Destacar ServerManager no tab de membros")
+        except Exception:
+            pass
 
     try:
         await bot.tree.sync()
@@ -969,12 +998,44 @@ async def on_ready():
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
+    logger.info(f"Bot adicionado ao servidor: {guild.name} (ID: {guild.id})")
+
+    # 1. Tenta destacar o bot imediatamente no tab de membros (hoist=True)
+    try:
+        bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+        if bot_member and bot_member.guild_permissions.manage_roles:
+            top_r = bot_member.top_role
+            if top_r and not top_r.is_default() and not top_r.hoist:
+                await top_r.edit(hoist=True, reason="Destacar ServerManager no tab de membros")
+    except Exception as e:
+        logger.debug(f"Ajuste hoist on_guild_join: {e}")
+
+    # 2. Sincroniza Slash Commands no novo servidor
     try:
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
         logger.info(f"Comandos sincronizados no novo servidor: {guild.name}")
     except Exception as e:
         logger.warning(f"Erro ao sincronizar novo servidor: {e}")
+
+    # 3. Envia confirmação visual imediata com embed no canal principal
+    try:
+        target_ch = guild.system_channel
+        if not target_ch or not target_ch.permissions_for(guild.me).send_messages:
+            for ch in guild.text_channels:
+                if ch.permissions_for(guild.me).send_messages:
+                    target_ch = ch
+                    break
+
+        if target_ch:
+            embed = await make_setup_embed(guild)
+            await target_ch.send(
+                "👋 **ServerManager Conectado e Pronto!**\n"
+                "⚡ **Dica de Performance:** Se os comandos `/` demorarem alguns segundos para aparecer no seu cliente Discord devido ao cache local, use o prefixo imediato `!setup` ou aperte `Ctrl + R` no Discord.",
+                embed=embed
+            )
+    except Exception as e:
+        logger.debug(f"Mensagem de boas-vindas on_guild_join: {e}")
 
 
 def run():
