@@ -8,6 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 from aiohttp import web
 
+# Configuração de Logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DiscordManager")
 
@@ -33,26 +34,70 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+
 # =====================================================================
-#  VERIFICAÇÃO DE SEGURANÇA E RESTRIÇÃO DE ACESSO
+#  FUNÇÕES SEGURAS DE HIERARQUIA E SERVIDORES (SEM INDEXERROR)
 # =====================================================================
-def is_authorized_admin(interaction: discord.Interaction) -> bool:
-    """Verifica se o usuário é o Dono do Servidor ou possui permissão de Administrador."""
-    if not interaction.guild:
+def get_highest_role(guild: discord.Guild) -> discord.Role | None:
+    """Retorna o cargo mais alto de forma 100% segura sem usar índices diretos."""
+    if not guild or not guild.roles:
+        return None
+    valid_roles = [r for r in guild.roles if not r.is_default()]
+    if not valid_roles:
+        return getattr(guild, "default_role", None)
+    return max(valid_roles, key=lambda r: r.position)
+
+
+def check_bot_is_top(guild: discord.Guild) -> bool:
+    """Verifica com resiliência se o cargo do bot está no topo da hierarquia."""
+    if not guild:
         return False
-    # O dono do servidor SEMPRE tem permissão total
-    if interaction.user.id == interaction.guild.owner_id:
+    bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+    if not bot_member:
+        return False
+    highest_role = get_highest_role(guild)
+    if not highest_role:
         return True
-    # Administradores
-    if isinstance(interaction.user, discord.Member):
-        if interaction.user.guild_permissions.administrator:
-            return True
-    if hasattr(interaction, "permissions") and interaction.permissions.administrator:
+    return bot_member.top_role.position >= highest_role.position
+
+
+def is_authorized_admin(interaction_or_ctx) -> bool:
+    """Verifica se o usuário é o Dono do Servidor ou possui permissão de Administrador."""
+    guild = getattr(interaction_or_ctx, "guild", None)
+    if not guild:
+        return False
+
+    # Context tem .author, Interaction tem .user
+    user = getattr(interaction_or_ctx, "author", None)
+    if user is None:
+        user = getattr(interaction_or_ctx, "user", None)
+
+    if not user:
+        return False
+
+    # 1. O dono do servidor tem bypass absoluto
+    if user.id == guild.owner_id:
         return True
+
+    # 2. Dono da aplicação / bot
+    if bot.owner_id and user.id == bot.owner_id:
+        return True
+
+    # 3. Permissões de administrador no membro
+    guild_perms = getattr(user, "guild_permissions", None)
+    if guild_perms and getattr(guild_perms, "administrator", False):
+        return True
+
+    # 4. Permissões na interação
+    perms = getattr(interaction_or_ctx, "permissions", None)
+    if isinstance(perms, discord.Permissions) and perms.administrator:
+        return True
+
     return False
 
+
 async def check_admin_permission(interaction: discord.Interaction) -> bool:
-    """Garante que membros comuns recebam bloqueio imediato."""
+    """Bloqueio para membros não autorizados em Slash Commands."""
     if not is_authorized_admin(interaction):
         await interaction.response.send_message(
             "⛔ **Acesso Negado:** Apenas o Dono do Servidor ou Administradores autorizados podem executar comandos deste bot.",
@@ -92,7 +137,7 @@ class ConfirmDangerAction(discord.ui.View):
 
 
 # =====================================================================
-#  FUNÇÕES AUXILIARES DE CLONAGEM
+#  FUNÇÕES AUXILIARES DE CLONAGEM RESILIENTES
 # =====================================================================
 def build_overwrites(old_overwrites: dict, role_map: dict, target_guild: discord.Guild) -> dict:
     new_overwrites = {}
@@ -103,6 +148,7 @@ def build_overwrites(old_overwrites: dict, role_map: dict, target_guild: discord
             elif target in role_map:
                 new_overwrites[role_map[target]] = perms
     return new_overwrites
+
 
 async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord.Guild) -> tuple[dict, int]:
     role_map = {source_guild.default_role: target_guild.default_role}
@@ -137,6 +183,7 @@ async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord
             logger.warning(f"Erro ao criar cargo {role.name}: {e}")
 
     return role_map, created_count
+
 
 async def execute_clone_channels(source_guild: discord.Guild, target_guild: discord.Guild, role_map: dict = None) -> tuple[int, int]:
     if role_map is None:
@@ -196,6 +243,7 @@ async def execute_clone_channels(source_guild: discord.Guild, target_guild: disc
 
     return categories_created, channels_created
 
+
 async def execute_clone_emojis(source_guild: discord.Guild, target_guild: discord.Guild) -> int:
     existing = {e.name for e in target_guild.emojis}
     copied = 0
@@ -215,22 +263,11 @@ async def execute_clone_emojis(source_guild: discord.Guild, target_guild: discor
     return copied
 
 
-# =====================================================================
-#  SLASH COMMANDS DO DISCORD (Com default_permissions para administradores)
-# =====================================================================
-
-@bot.tree.command(name="setup", description="Painel de controle e status do ServerManager.")
-@app_commands.default_permissions(administrator=True)
-async def cmd_setup(interaction: discord.Interaction):
-    if not await check_admin_permission(interaction):
-        return
-
-    guild = interaction.guild
-    bot_member = guild.me
-    bot_top_role = bot_member.top_role
-    highest_server_role = guild.roles[-1]
-
-    is_top_hierarchy = (bot_top_role.position >= highest_server_role.position)
+def make_setup_embed(guild: discord.Guild) -> discord.Embed:
+    """Gera o Embed de status do servidor de forma 100% segura contra erros."""
+    bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+    is_top = check_bot_is_top(guild)
+    is_admin = bot_member.guild_permissions.administrator if bot_member else False
 
     embed = discord.Embed(
         title="🛡️ ServerManager — Painel de Controle",
@@ -239,26 +276,41 @@ async def cmd_setup(interaction: discord.Interaction):
     )
     embed.add_field(name="📍 Servidor Atual", value=f"**{guild.name}** (`{guild.id}`)", inline=False)
     embed.add_field(name="👑 Dono do Servidor", value=f"<@{guild.owner_id}>", inline=True)
-    embed.add_field(name="⚡ Permissão Admin", value="✅ Concedida" if bot_member.guild_permissions.administrator else "❌ Ausente", inline=True)
-    embed.add_field(name="📶 Posição no Topo", value="✅ No Topo dos Cargos" if is_top_hierarchy else "⚠️ Suba o cargo do bot para o topo!", inline=True)
+    embed.add_field(name="⚡ Permissão Admin", value="✅ Concedida" if is_admin else "❌ Ausente", inline=True)
+    embed.add_field(name="📶 Posição no Topo", value="✅ No Topo dos Cargos" if is_top else "⚠️ Suba o cargo do bot para o topo!", inline=True)
 
     servers_desc = "\n".join([f"• `{g.name}` (`{g.id}`)" for g in bot.guilds])
     embed.add_field(name="🌐 Servidores Conectados ao Bot", value=servers_desc[:1024] if servers_desc else "Apenas este", inline=False)
 
     embed.add_field(
-        name="📜 Comandos Disponíveis (Privados)",
+        name="📜 Comandos (Prefix ou Barra /)",
         value=(
-            "`/clonar_tudo [id_origem]` — Clona cargos, canais e emojis\n"
-            "`/clonar_cargos [id_origem]` — Clona apenas os cargos\n"
-            "`/clonar_canais [id_origem]` — Clona apenas categorias e canais\n"
-            "`/clonar_emojis [id_origem]` — Clona os emojis personalizados\n"
-            "`/apagar_categoria [categoria]` — Apaga uma categoria e todos os canais nela\n"
-            "`/limpar_canais` — Reseta todos os canais do servidor\n"
-            "`/limpar_cargos` — Reseta todos os cargos personalizados"
+            "• `/setup` ou `!setup` — Mostra este painel\n"
+            "• `!sync` — Força registro imediato dos comandos /\n"
+            "• `/clonar_tudo [id]` ou `!clonar_tudo <id>` — Clona tudo\n"
+            "• `/clonar_cargos [id]` ou `!clonar_cargos <id>` — Clona só cargos\n"
+            "• `/clonar_canais [id]` ou `!clonar_canais <id>` — Clona só canais\n"
+            "• `/clonar_emojis [id]` ou `!clonar_emojis <id>` — Clona emojis\n"
+            "• `/apagar_categoria` ou `!apagar_categoria <id_ou_nome>` — Apaga categoria inteira\n"
+            "• `/limpar_canais` ou `!limpar_canais` — Reseta canais\n"
+            "• `/limpar_cargos` ou `!limpar_cargos` — Reseta cargos"
         ),
         inline=False
     )
     embed.set_footer(text="Segurança Ativa: Somente o dono ou administradores têm acesso a estes comandos.")
+    return embed
+
+
+# =====================================================================
+#  SLASH COMMANDS (/)
+# =====================================================================
+
+@bot.tree.command(name="setup", description="Painel de controle e status do ServerManager.")
+@app_commands.default_permissions(administrator=True)
+async def cmd_setup(interaction: discord.Interaction):
+    if not await check_admin_permission(interaction):
+        return
+    embed = make_setup_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -276,7 +328,7 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
         return await interaction.response.send_message("❌ ID do servidor inválido.", ephemeral=True)
 
     if not source_guild:
-        return await interaction.response.send_message("❌ Não encontrei esse servidor. Verifique se o bot está adicionado nele!", ephemeral=True)
+        return await interaction.response.send_message("❌ Servidor de origem não encontrado. O bot precisa estar adicionado nele!", ephemeral=True)
 
     if source_guild.id == interaction.guild_id:
         return await interaction.response.send_message("❌ O servidor de origem não pode ser o mesmo atual.", ephemeral=True)
@@ -301,7 +353,7 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
         cats_cnt, chs_cnt = await execute_clone_channels(source_guild, target_guild, role_map)
         await msg.edit(content=f"✅ Cargos ({roles_cnt}) e Canais ({chs_cnt}) clonados.\n🚀 [3/3] Clonando emojis...")
         emojis_cnt = await execute_clone_emojis(source_guild, target_guild)
-        await msg.edit(content=f"🎉 **Clonagem Completa Concluída com Sucesso!**\n• {roles_cnt} Cargos criados\n• {cats_cnt} Categorias criadas\n• {chs_cnt} Canais criados\n• {emojis_cnt} Emojis copiados")
+        await msg.edit(content=f"🎉 **Clonagem Completa Concluída!**\n• {roles_cnt} Cargos\n• {cats_cnt} Categorias\n• {chs_cnt} Canais\n• {emojis_cnt} Emojis")
 
 
 @bot.tree.command(name="clonar_cargos", description="Clona APENAS os cargos de outro servidor.")
@@ -315,14 +367,14 @@ async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
         source_id = int(id_origem.strip())
         source_guild = bot.get_guild(source_id)
     except ValueError:
-        return await interaction.response.send_message("❌ ID do servidor inválido.", ephemeral=True)
+        return await interaction.response.send_message("❌ ID inválido.", ephemeral=True)
 
     if not source_guild:
-        return await interaction.response.send_message("❌ Servidor de origem não encontrado. O bot precisa estar nele!", ephemeral=True)
+        return await interaction.response.send_message("❌ Servidor de origem não encontrado.", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
     _, roles_cnt = await execute_clone_roles(source_guild, interaction.guild)
-    await interaction.followup.send(f"✅ **Sucesso:** {roles_cnt} cargos clonados de **{source_guild.name}** com cores e permissões!", ephemeral=True)
+    await interaction.followup.send(f"✅ **Sucesso:** {roles_cnt} cargos clonados de **{source_guild.name}**!", ephemeral=True)
 
 
 @bot.tree.command(name="clonar_canais", description="Clona APENAS as categorias e canais de outro servidor.")
@@ -336,7 +388,7 @@ async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
         source_id = int(id_origem.strip())
         source_guild = bot.get_guild(source_id)
     except ValueError:
-        return await interaction.response.send_message("❌ ID do servidor inválido.", ephemeral=True)
+        return await interaction.response.send_message("❌ ID inválido.", ephemeral=True)
 
     if not source_guild:
         return await interaction.response.send_message("❌ Servidor de origem não encontrado.", ephemeral=True)
@@ -399,7 +451,7 @@ async def cmd_apagar_categoria(interaction: discord.Interaction, categoria: disc
         except Exception:
             pass
 
-        await msg.edit(content=f"✅ Categoria **{categoria.name}** e todos os seus {channels_count} canais foram apagados com sucesso!")
+        await msg.edit(content=f"✅ Categoria **{categoria.name}** e todos os seus {channels_count} canais foram apagados!")
 
 
 @bot.tree.command(name="limpar_canais", description="🚨 Reseta o servidor: Apaga TODOS os canais existentes.")
@@ -462,55 +514,219 @@ async def cmd_limpar_cargos(interaction: discord.Interaction):
 
 
 # =====================================================================
-#  COMANDO DE PREFIXO DE FALLBACK (!setup e !sync)
+#  PREFIX COMMANDS (!) — FUNCIONAM IMEDIATAMENTE SEM ESPERAR DISCORD
 # =====================================================================
+
 @bot.command(name="setup")
 async def prefix_setup(ctx: commands.Context):
-    """Comando alternativo via prefixo !setup se o Discord demorar para carregar os slash commands."""
-    if ctx.author.id != ctx.guild.owner_id and not ctx.author.guild_permissions.administrator:
+    """Comando !setup com checagem segura contra IndexError."""
+    if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado. Apenas o Dono ou Administradores podem usar.")
-
-    guild = ctx.guild
-    bot_member = guild.me
-    is_top = (bot_member.top_role.position >= guild.roles[-1].position)
-
-    embed = discord.Embed(
-        title="🛡️ ServerManager — Status do Bot (!setup)",
-        description="Bot ativo e conectado!",
-        color=0x335FFF
-    )
-    embed.add_field(name="Servidor", value=guild.name, inline=True)
-    embed.add_field(name="Cargo no Topo?", value="✅ Sim" if is_top else "⚠️ Suba o cargo do bot para o topo!", inline=True)
-    embed.add_field(name="Comandos", value="Use `/setup` para ver todos os comandos Slash ou digite `!sync` para forçar o carregamento imediato dos comandos.", inline=False)
+    embed = make_setup_embed(ctx.guild)
     await ctx.reply(embed=embed)
 
 
 @bot.command(name="sync")
 async def prefix_sync(ctx: commands.Context):
-    """Força sincronização imediata dos Slash Commands no servidor atual."""
-    if ctx.author.id != ctx.guild.owner_id and not ctx.author.guild_permissions.administrator:
+    """Sincroniza os comandos Slash no servidor atual."""
+    if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
 
     msg = await ctx.reply("⏳ Sincronizando comandos slash neste servidor...")
     try:
         bot.tree.copy_global_to(guild=ctx.guild)
         synced = await bot.tree.sync(guild=ctx.guild)
-        await msg.edit(content=f"✅ Sincronizados {len(synced)} comandos slash com sucesso neste servidor! Pressione `Ctrl + R` no seu Discord se ainda não aparecerem.")
+        await msg.edit(content=f"✅ Sincronizados {len(synced)} comandos slash com sucesso neste servidor! Pressione `Ctrl + R` se ainda não aparecerem.")
     except Exception as e:
         await msg.edit(content=f"❌ Erro ao sincronizar: {e}")
 
 
+@bot.command(name="clonar_tudo")
+async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None):
+    """Clona tudo via comando de prefixo !clonar_tudo <id>."""
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado.")
+    if not id_origem:
+        return await ctx.reply("❌ Use: `!clonar_tudo <id_do_servidor_origem>`")
+
+    try:
+        source_id = int(id_origem.strip())
+        source_guild = bot.get_guild(source_id)
+    except ValueError:
+        return await ctx.reply("❌ ID de servidor inválido.")
+
+    if not source_guild:
+        return await ctx.reply("❌ Servidor não encontrado. Certifique-se de que o bot está adicionado nele!")
+
+    msg = await ctx.reply(f"🚀 Iniciando clonagem completa de **{source_guild.name}**...")
+    role_map, roles_cnt = await execute_clone_roles(source_guild, ctx.guild)
+    cats_cnt, chs_cnt = await execute_clone_channels(source_guild, ctx.guild, role_map)
+    emojis_cnt = await execute_clone_emojis(source_guild, ctx.guild)
+    await msg.edit(content=f"🎉 **Clonagem Concluída!**\n• {roles_cnt} Cargos\n• {cats_cnt} Categorias\n• {chs_cnt} Canais\n• {emojis_cnt} Emojis")
+
+
+@bot.command(name="clonar_cargos")
+async def prefix_clonar_cargos(ctx: commands.Context, id_origem: str = None):
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado.")
+    if not id_origem:
+        return await ctx.reply("❌ Use: `!clonar_cargos <id_do_servidor_origem>`")
+
+    try:
+        source_id = int(id_origem.strip())
+        source_guild = bot.get_guild(source_id)
+    except ValueError:
+        return await ctx.reply("❌ ID inválido.")
+
+    if not source_guild:
+        return await ctx.reply("❌ Servidor não encontrado.")
+
+    msg = await ctx.reply(f"🚀 Clonando cargos de **{source_guild.name}**...")
+    _, roles_cnt = await execute_clone_roles(source_guild, ctx.guild)
+    await msg.edit(content=f"✅ Sucesso! {roles_cnt} cargos clonados de **{source_guild.name}**.")
+
+
+@bot.command(name="clonar_canais")
+async def prefix_clonar_canais(ctx: commands.Context, id_origem: str = None):
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado.")
+    if not id_origem:
+        return await ctx.reply("❌ Use: `!clonar_canais <id_do_servidor_origem>`")
+
+    try:
+        source_id = int(id_origem.strip())
+        source_guild = bot.get_guild(source_id)
+    except ValueError:
+        return await ctx.reply("❌ ID inválido.")
+
+    if not source_guild:
+        return await ctx.reply("❌ Servidor não encontrado.")
+
+    msg = await ctx.reply(f"🚀 Clonando canais de **{source_guild.name}**...")
+    cats_cnt, chs_cnt = await execute_clone_channels(source_guild, ctx.guild)
+    await msg.edit(content=f"✅ Sucesso! {cats_cnt} categorias e {chs_cnt} canais clonados.")
+
+
+@bot.command(name="clonar_emojis")
+async def prefix_clonar_emojis(ctx: commands.Context, id_origem: str = None):
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado.")
+    if not id_origem:
+        return await ctx.reply("❌ Use: `!clonar_emojis <id_do_servidor_origem>`")
+
+    try:
+        source_id = int(id_origem.strip())
+        source_guild = bot.get_guild(source_id)
+    except ValueError:
+        return await ctx.reply("❌ ID inválido.")
+
+    if not source_guild:
+        return await ctx.reply("❌ Servidor não encontrado.")
+
+    msg = await ctx.reply(f"🚀 Clonando emojis de **{source_guild.name}**...")
+    count = await execute_clone_emojis(source_guild, ctx.guild)
+    await msg.edit(content=f"✅ Sucesso! {count} emojis copiados.")
+
+
+@bot.command(name="apagar_categoria")
+async def prefix_apagar_categoria(ctx: commands.Context, *, nome_ou_id: str = None):
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado.")
+    if not nome_ou_id:
+        return await ctx.reply("❌ Use: `!apagar_categoria <nome ou ID da categoria>`")
+
+    cat_target = None
+    for cat in ctx.guild.categories:
+        if str(cat.id) == nome_ou_id.strip() or cat.name.lower() == nome_ou_id.strip().lower():
+            cat_target = cat
+            break
+
+    if not cat_target:
+        return await ctx.reply("❌ Categoria não encontrada.")
+
+    channels_count = len(cat_target.channels)
+    msg = await ctx.reply(f"🗑️ Apagando categoria '{cat_target.name}' e seus {channels_count} canais...")
+    for ch in list(cat_target.channels):
+        try:
+            await ch.delete(reason="Exclusão em massa solicitada via !apagar_categoria")
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+    try:
+        await cat_target.delete(reason="Exclusão em massa de categoria")
+    except Exception:
+        pass
+
+    await msg.edit(content=f"✅ Categoria **{cat_target.name}** e todos os seus {channels_count} canais foram apagados!")
+
+
+@bot.command(name="limpar_canais")
+async def prefix_limpar_canais(ctx: commands.Context):
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado.")
+
+    view = ConfirmDangerAction(ctx.author.id, "Limpar Canais")
+    confirm_msg = await ctx.reply("⚠️ **ATENÇÃO:** Isso apagará TODOS os canais deste servidor! Confirma?", view=view)
+    await view.wait()
+
+    if view.value:
+        temp_ch = await ctx.guild.create_text_channel(name="suporte-reset")
+        for ch in list(ctx.guild.channels):
+            if ch.id == temp_ch.id:
+                continue
+            try:
+                await ch.delete(reason="Reset geral")
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+        await temp_ch.send("✅ Todos os canais foram excluídos!")
+
+
+@bot.command(name="limpar_cargos")
+async def prefix_limpar_cargos(ctx: commands.Context):
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado.")
+
+    roles = [r for r in ctx.guild.roles if not r.is_default() and not r.managed and r < ctx.guild.me.top_role]
+    view = ConfirmDangerAction(ctx.author.id, "Limpar Cargos")
+    confirm_msg = await ctx.reply(f"⚠️ **ATENÇÃO:** Isso apagará {len(roles)} cargos personalizados! Confirma?", view=view)
+    await view.wait()
+
+    if view.value:
+        deleted = 0
+        for r in roles:
+            try:
+                await r.delete(reason="Reset geral de cargos")
+                deleted += 1
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+        await ctx.reply(f"✅ Reset concluído! {deleted} cargos foram excluídos.")
+
+
 # =====================================================================
-#  TRATAMENTO GLOBAL DE ERROS DE COMANDOS
+#  TRATAMENTO GLOBAL DE ERROS (SLASH E PREFIXO)
 # =====================================================================
 @bot.tree.error
 async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    logger.error(f"Erro em comando: {error}")
+    logger.error(f"Erro em slash command: {error}")
     err_text = f"⚠️ Ocorreu um erro ao executar este comando: `{error}`"
     if interaction.response.is_done():
         await interaction.followup.send(err_text, ephemeral=True)
     else:
         await interaction.response.send_message(err_text, ephemeral=True)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    logger.error(f"Erro em prefix command: {error}")
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(f"❌ Argumento ausente: `{error.param.name}`. Digite `!setup` para ver os exemplos.")
+    elif isinstance(error, commands.CommandNotFound):
+        pass
+    else:
+        await ctx.reply(f"⚠️ Erro ao executar: `{error}`")
 
 
 # =====================================================================
@@ -543,17 +759,16 @@ async def start_web_server():
 @bot.event
 async def on_ready():
     logger.info(f"Bot conectado como {bot.user} (ID: {bot.user.id})")
-    
-    # Sincroniza os comandos Slash em cada servidor individualmente (instantâneo!)
+
+    # Sincroniza os comandos Slash em cada servidor individualmente
     for guild in bot.guilds:
         try:
             bot.tree.copy_global_to(guild=guild)
             await bot.tree.sync(guild=guild)
-            logger.info(f"Comandos sincronizados instantaneamente no servidor: {guild.name}")
+            logger.info(f"Comandos sincronizados no servidor: {guild.name}")
         except Exception as e:
             logger.warning(f"Erro ao sincronizar na guild {guild.name}: {e}")
 
-    # Sincroniza globalmente também
     try:
         await bot.tree.sync()
     except Exception:
@@ -565,14 +780,13 @@ async def on_ready():
         logger.warning(f"Web server warning: {e}")
 
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="seus servidores | /setup"),
+        activity=discord.Activity(type=discord.ActivityType.watching, name="seus servidores | /setup | !setup"),
         status=discord.Status.online
     )
 
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    """Ao entrar em um novo servidor, sincroniza os comandos instantaneamente nele."""
     try:
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
