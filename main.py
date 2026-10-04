@@ -263,11 +263,40 @@ async def execute_clone_emojis(source_guild: discord.Guild, target_guild: discor
     return copied
 
 
-def make_setup_embed(guild: discord.Guild) -> discord.Embed:
+async def get_owner_display(guild: discord.Guild) -> str:
+    """Busca o dono do servidor de forma resiliente via cache ou API."""
+    if not guild:
+        return "Não identificado"
+
+    owner = guild.owner
+    if not owner and guild.owner_id:
+        owner = guild.get_member(guild.owner_id)
+    if not owner and guild.owner_id:
+        try:
+            owner = await bot.fetch_user(guild.owner_id)
+        except Exception:
+            pass
+    if not owner:
+        try:
+            full_guild = await bot.fetch_guild(guild.id)
+            if full_guild.owner_id:
+                owner = await bot.fetch_user(full_guild.owner_id)
+        except Exception:
+            pass
+
+    if owner:
+        return f"**{owner.name}** (<@{owner.id}>)"
+    if guild.owner_id:
+        return f"<@{guild.owner_id}>"
+    return "Não identificado"
+
+
+async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
     """Gera o Embed de status do servidor de forma 100% segura contra erros."""
     bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
     is_top = check_bot_is_top(guild)
     is_admin = bot_member.guild_permissions.administrator if bot_member else False
+    owner_str = await get_owner_display(guild)
 
     embed = discord.Embed(
         title="🛡️ ServerManager — Painel de Controle",
@@ -275,7 +304,7 @@ def make_setup_embed(guild: discord.Guild) -> discord.Embed:
         color=0x335FFF
     )
     embed.add_field(name="📍 Servidor Atual", value=f"**{guild.name}** (`{guild.id}`)", inline=False)
-    embed.add_field(name="👑 Dono do Servidor", value=f"<@{guild.owner_id}>", inline=True)
+    embed.add_field(name="👑 Dono do Servidor", value=owner_str, inline=True)
     embed.add_field(name="⚡ Permissão Admin", value="✅ Concedida" if is_admin else "❌ Ausente", inline=True)
     embed.add_field(name="📶 Posição no Topo", value="✅ No Topo dos Cargos" if is_top else "⚠️ Suba o cargo do bot para o topo!", inline=True)
 
@@ -310,7 +339,7 @@ def make_setup_embed(guild: discord.Guild) -> discord.Embed:
 async def cmd_setup(interaction: discord.Interaction):
     if not await check_admin_permission(interaction):
         return
-    embed = make_setup_embed(interaction.guild)
+    embed = await make_setup_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -522,7 +551,7 @@ async def prefix_setup(ctx: commands.Context):
     """Comando !setup com checagem segura contra IndexError."""
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado. Apenas o Dono ou Administradores podem usar.")
-    embed = make_setup_embed(ctx.guild)
+    embed = await make_setup_embed(ctx.guild)
     await ctx.reply(embed=embed)
 
 
