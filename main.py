@@ -1374,15 +1374,19 @@ async def prefix_gerar_id(ctx: commands.Context):
 
 @bot.command(name="sync")
 async def prefix_sync(ctx: commands.Context):
-    """Sincroniza os comandos Slash no servidor atual."""
+    """Remove comandos slash duplicados e sincroniza a árvore oficial."""
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
 
-    msg = await ctx.reply("⏳ Sincronizando comandos slash neste servidor...")
+    msg = await ctx.reply("⏳ Removendo comandos duplicados e sincronizando...")
     try:
-        bot.tree.copy_global_to(guild=ctx.guild)
-        synced = await bot.tree.sync(guild=ctx.guild)
-        await msg.edit(content=f"✅ Sincronizados {len(synced)} comandos slash com sucesso neste servidor! Pressione `Ctrl + R` se ainda não aparecerem.")
+        # 1. Limpa comandos registrados no nível da guilda (origem das duplicatas)
+        bot.tree.clear_commands(guild=ctx.guild)
+        await bot.tree.sync(guild=ctx.guild)
+
+        # 2. Sincroniza a árvore global única
+        synced = await bot.tree.sync()
+        await msg.edit(content=f"✅ Sincronização concluída! Comandos locais duplicados foram removidos ({len(synced)} comandos únicos ativos).\n💡 *Pressione `Ctrl + R` no Discord para atualizar o cache.*")
     except Exception as e:
         await msg.edit(content=f"❌ Erro ao sincronizar: {e}")
 
@@ -1859,14 +1863,14 @@ async def start_web_server():
 async def on_ready():
     logger.info(f"Bot conectado como {bot.user} (ID: {bot.user.id})")
 
-    # Sincroniza os comandos Slash em cada servidor e destaca cargo no tab
+    # Limpa comandos locais de cada servidor para eliminar qualquer duplicata
     for guild in bot.guilds:
         try:
-            bot.tree.copy_global_to(guild=guild)
+            bot.tree.clear_commands(guild=guild)
             await bot.tree.sync(guild=guild)
-            logger.info(f"Comandos sincronizados no servidor: {guild.name}")
+            logger.info(f"Comandos locais limpos com sucesso no servidor: {guild.name}")
         except Exception as e:
-            logger.warning(f"Erro ao sincronizar na guild {guild.name}: {e}")
+            logger.warning(f"Erro ao limpar comandos locais na guild {guild.name}: {e}")
 
         # Tenta exibir o cargo do bot destacado no tab (hoist=True)
         try:
@@ -1878,10 +1882,12 @@ async def on_ready():
         except Exception:
             pass
 
+    # Sincroniza APENAS a árvore global única (elimina 100% dos comandos duplicados)
     try:
-        await bot.tree.sync()
-    except Exception:
-        pass
+        synced = await bot.tree.sync()
+        logger.info(f"{len(synced)} comandos slash globais sincronizados com sucesso.")
+    except Exception as e:
+        logger.warning(f"Erro ao sincronizar comandos globais: {e}")
 
     try:
         await start_web_server()
@@ -1908,13 +1914,13 @@ async def on_guild_join(guild: discord.Guild):
     except Exception as e:
         logger.debug(f"Ajuste hoist on_guild_join: {e}")
 
-    # 2. Sincroniza Slash Commands no novo servidor
+    # 2. Garante que não haja comandos locais duplicados no novo servidor
     try:
-        bot.tree.copy_global_to(guild=guild)
+        bot.tree.clear_commands(guild=guild)
         await bot.tree.sync(guild=guild)
-        logger.info(f"Comandos sincronizados no novo servidor: {guild.name}")
+        logger.info(f"Comandos locais limpos no novo servidor: {guild.name}")
     except Exception as e:
-        logger.warning(f"Erro ao sincronizar novo servidor: {e}")
+        logger.warning(f"Erro ao limpar comandos locais no novo servidor: {e}")
 
     # 3. Envia confirmação visual imediata com embed no canal principal
     try:
