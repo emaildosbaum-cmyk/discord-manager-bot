@@ -421,24 +421,24 @@ async def get_server_id_from_sync_code(sync_code: str) -> int | None:
 
 
 async def resolve_source_guild(input_str: str) -> tuple[discord.Guild | None, str | None]:
-    """Resolve um servidor pelo ID numérico ou pelo código Supabase (ex: SRV-A4F9B2)."""
+    """Resolve um servidor EXCLUSIVAMENTE pelo Código Privado do Supabase (ex: SRV-XXXXXX)."""
     if not input_str:
-        return None, "Nenhum código ou ID fornecido."
+        return None, "Nenhum código fornecido."
 
     cleaned = input_str.strip().upper()
 
-    # 1. Tenta buscar por código do Supabase
+    # 1. Bloqueia tentativa de usar ID numérico público do Discord por segurança
+    if input_str.strip().isdigit():
+        return None, "🔒 **Acesso Negado:** Por segurança, não é permitido clonar servidores usando ID numérico público. Você só pode clonar se o dono do servidor de origem te passar o **Código Privado** dele (ex: `SRV-XXXXXX`)."
+
+    # 2. Busca por código do Supabase
     code_to_check = cleaned if cleaned.startswith("SRV-") else f"SRV-{cleaned}"
     server_id = await get_server_id_from_sync_code(code_to_check)
     if not server_id:
         server_id = await get_server_id_from_sync_code(cleaned)
 
-    # 2. Se não encontrou por código e a entrada for numérica, usa como Guild ID do Discord
-    if not server_id and input_str.strip().isdigit():
-        server_id = int(input_str.strip())
-
     if not server_id:
-        return None, f"Servidor ou Código `{input_str}` não encontrado. Use o código exibido no `/setup` do servidor de origem."
+        return None, f"Código `{input_str}` não encontrado ou inválido. O responsável pelo servidor de origem precisa rodar `/setup` e te passar o código secreto."
 
     source_guild = bot.get_guild(int(server_id))
     if not source_guild:
@@ -448,13 +448,13 @@ async def resolve_source_guild(input_str: str) -> tuple[discord.Guild | None, st
             pass
 
     if not source_guild:
-        return None, f"Servidor `{input_str}` localizado, mas o bot não está nele! Adicione o bot ao servidor de origem primeiro."
+        return None, f"Servidor associado ao código `{input_str}` encontrado, mas o bot não está nele! Adicione o bot ao servidor de origem primeiro."
 
     return source_guild, None
 
 
 async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
-    """Gera o Embed de status do servidor de forma 100% segura contra erros."""
+    """Gera o Embed de status do servidor de forma 100% segura contra erros e vazamentos."""
     bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
     is_top = check_bot_is_top(guild)
     is_admin = bot_member.guild_permissions.administrator if bot_member else False
@@ -463,39 +463,36 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
 
     embed = discord.Embed(
         title="🛡️ ServerManager — Painel de Controle",
-        description="Sistema de gerenciamento e clonagem de servidor ativo e protegido.",
+        description="Sistema de gerenciamento e clonagem de servidor ativo e 100% isolado.",
         color=0x335FFF
     )
     embed.add_field(name="📍 Servidor Atual", value=f"**{guild.name}** (`{guild.id}`)", inline=False)
     embed.add_field(
-        name="🔑 ID de Clonagem (Supabase)",
-        value=f"**`{sync_code}`**\n*(Copie este código para clonar este servidor em outro!)*",
+        name="🔑 Código Privado de Clonagem",
+        value=f"**`{sync_code}`**\n*(Mantenha em segredo! Apenas quem tiver este código poderá clonar este servidor.)*",
         inline=False
     )
     embed.add_field(name="👑 Dono do Servidor", value=owner_str, inline=True)
     embed.add_field(name="⚡ Permissão Admin", value="✅ Concedida" if is_admin else "❌ Ausente", inline=True)
     embed.add_field(name="📶 Posição no Topo", value="✅ No Topo dos Cargos" if is_top else "⚠️ Suba o cargo do bot para o topo!", inline=True)
 
-    servers_desc = "\n".join([f"• `{g.name}` (`{g.id}`)" for g in bot.guilds])
-    embed.add_field(name="🌐 Servidores Conectados ao Bot", value=servers_desc[:1024] if servers_desc else "Apenas este", inline=False)
-
     embed.add_field(
         name="📜 Comandos (Prefix ou Barra /)",
         value=(
             "• `/setup` ou `!setup` — Mostra este painel\n"
-            "• `/gerar_id` ou `!gerar_id` — Gera um novo código no Supabase\n"
+            "• `/gerar_id` ou `!gerar_id` — Gera um novo código secreto\n"
             "• `!sync` — Força registro imediato dos comandos /\n"
-            "• `/clonar_tudo <código ou id>` — Clona tudo de outro server\n"
-            "• `/clonar_cargos <código ou id>` — Clona só cargos\n"
-            "• `/clonar_canais <código ou id>` — Clona só canais\n"
-            "• `/clonar_emojis <código ou id>` — Clona emojis\n"
+            "• `/clonar_tudo <código>` — Clona tudo (exige código secreto)\n"
+            "• `/clonar_cargos <código>` — Clona só cargos\n"
+            "• `/clonar_canais <código>` — Clona só canais\n"
+            "• `/clonar_emojis <código>` — Clona emojis\n"
             "• `/apagar_categoria <categoria>` — Apaga categoria inteira\n"
             "• `/limpar_canais` — Reseta todos os canais\n"
             "• `/limpar_cargos` — Reseta todos os cargos"
         ),
         inline=False
     )
-    embed.set_footer(text="Segurança Ativa: Somente o dono ou administradores têm acesso a estes comandos.")
+    embed.set_footer(text="Privacidade Ativa: Nenhum outro servidor conectado é revelado.")
     return embed
 
 
@@ -527,7 +524,7 @@ async def cmd_gerar_id(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="clonar_tudo", description="Clona cargos, categorias, canais e emojis de outro servidor.")
-@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de onde você quer copiar")
+@app_commands.describe(id_origem="Código secreto do servidor de onde você quer copiar (ex: SRV-XXXXXX)")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
@@ -564,7 +561,7 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_cargos", description="Clona APENAS os cargos de outro servidor.")
-@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
+@app_commands.describe(id_origem="Código secreto do servidor de origem (ex: SRV-XXXXXX)")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
@@ -580,7 +577,7 @@ async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_canais", description="Clona APENAS as categorias e canais de outro servidor.")
-@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
+@app_commands.describe(id_origem="Código secreto do servidor de origem (ex: SRV-XXXXXX)")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
@@ -596,7 +593,7 @@ async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_emojis", description="Clona os emojis de outro servidor.")
-@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
+@app_commands.describe(id_origem="Código secreto do servidor de origem (ex: SRV-XXXXXX)")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_emojis(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
@@ -748,11 +745,11 @@ async def prefix_sync(ctx: commands.Context):
 
 @bot.command(name="clonar_tudo")
 async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None):
-    """Clona tudo via comando de prefixo !clonar_tudo <id ou código>."""
+    """Clona tudo via comando de prefixo !clonar_tudo <código secreto>."""
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_tudo <código ou id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_tudo <código_do_servidor_origem>`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
@@ -770,7 +767,7 @@ async def prefix_clonar_cargos(ctx: commands.Context, id_origem: str = None):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_cargos <código ou id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_cargos <código_do_servidor_origem>`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
@@ -786,7 +783,7 @@ async def prefix_clonar_canais(ctx: commands.Context, id_origem: str = None):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_canais <código ou id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_canais <código_do_servidor_origem>`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
@@ -802,7 +799,7 @@ async def prefix_clonar_emojis(ctx: commands.Context, id_origem: str = None):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_emojis <código ou id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_emojis <código_do_servidor_origem>`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
@@ -856,16 +853,16 @@ async def prefix_limpar_canais(ctx: commands.Context):
     await view.wait()
 
     if view.value:
-        temp_ch = await ctx.guild.create_text_channel(name="suporte-reset")
+        temp_ch = await ctx.guild.create_text_channel(name="suporte-reset", reason="Canal temporário durante reset")
         for ch in list(ctx.guild.channels):
             if ch.id == temp_ch.id:
                 continue
             try:
-                await ch.delete(reason="Reset geral")
+                await ch.delete(reason="Reset geral de canais")
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
-        await temp_ch.send("✅ Todos os canais foram excluídos!")
+        await temp_ch.send("✅ **Reset de canais concluído!** Apenas este canal foi mantido para você continuar.")
 
 
 @bot.command(name="limpar_cargos")
