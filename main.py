@@ -8,11 +8,9 @@ from discord import app_commands
 from discord.ext import commands
 from aiohttp import web
 
-# Configuração de Logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DiscordManager")
 
-# Configuração do Token
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 def get_token():
     token = os.getenv("DISCORD_BOT_TOKEN")
@@ -31,6 +29,7 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.emojis = True
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -41,9 +40,14 @@ def is_authorized_admin(interaction: discord.Interaction) -> bool:
     """Verifica se o usuário é o Dono do Servidor ou possui permissão de Administrador."""
     if not interaction.guild:
         return False
+    # O dono do servidor SEMPRE tem permissão total
     if interaction.user.id == interaction.guild.owner_id:
         return True
-    if isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator:
+    # Administradores
+    if isinstance(interaction.user, discord.Member):
+        if interaction.user.guild_permissions.administrator:
+            return True
+    if hasattr(interaction, "permissions") and interaction.permissions.administrator:
         return True
     return False
 
@@ -146,7 +150,6 @@ async def execute_clone_channels(source_guild: discord.Guild, target_guild: disc
     categories_created = 0
     channels_created = 0
 
-    # Categorias
     for cat in sorted(source_guild.categories, key=lambda c: c.position):
         try:
             overwrites = build_overwrites(cat.overwrites, role_map, target_guild)
@@ -157,7 +160,6 @@ async def execute_clone_channels(source_guild: discord.Guild, target_guild: disc
         except Exception as e:
             logger.warning(f"Erro na categoria {cat.name}: {e}")
 
-    # Canais de Texto
     for ch in sorted(source_guild.text_channels, key=lambda c: c.position):
         try:
             parent = cat_map.get(ch.category_id) if ch.category_id else None
@@ -175,7 +177,6 @@ async def execute_clone_channels(source_guild: discord.Guild, target_guild: disc
         except Exception as e:
             logger.warning(f"Erro no canal #{ch.name}: {e}")
 
-    # Canais de Voz
     for vc in sorted(source_guild.voice_channels, key=lambda c: c.position):
         try:
             parent = cat_map.get(vc.category_id) if vc.category_id else None
@@ -215,11 +216,11 @@ async def execute_clone_emojis(source_guild: discord.Guild, target_guild: discor
 
 
 # =====================================================================
-#  SLASH COMMANDS DO DISCORD
+#  SLASH COMMANDS DO DISCORD (Com default_permissions para administradores)
 # =====================================================================
 
 @bot.tree.command(name="setup", description="Painel de controle e status do ServerManager.")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def cmd_setup(interaction: discord.Interaction):
     if not await check_admin_permission(interaction):
         return
@@ -230,7 +231,6 @@ async def cmd_setup(interaction: discord.Interaction):
     highest_server_role = guild.roles[-1]
 
     is_top_hierarchy = (bot_top_role.position >= highest_server_role.position)
-    other_servers = [g.name for g in bot.guilds if g.id != guild.id]
 
     embed = discord.Embed(
         title="🛡️ ServerManager — Painel de Controle",
@@ -258,13 +258,13 @@ async def cmd_setup(interaction: discord.Interaction):
         ),
         inline=False
     )
-    embed.set_footer(text="Segurança Ativa: Somente administradores têm acesso a estes comandos.")
+    embed.set_footer(text="Segurança Ativa: Somente o dono ou administradores têm acesso a estes comandos.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="clonar_tudo", description="Clona cargos, categorias, canais e emojis de outro servidor.")
 @app_commands.describe(id_origem="ID do servidor de onde você quer copiar")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
         return
@@ -306,7 +306,7 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
 
 @bot.tree.command(name="clonar_cargos", description="Clona APENAS os cargos de outro servidor.")
 @app_commands.describe(id_origem="ID do servidor de origem")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
         return
@@ -327,7 +327,7 @@ async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
 
 @bot.tree.command(name="clonar_canais", description="Clona APENAS as categorias e canais de outro servidor.")
 @app_commands.describe(id_origem="ID do servidor de origem")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
         return
@@ -348,7 +348,7 @@ async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
 
 @bot.tree.command(name="clonar_emojis", description="Clona os emojis de outro servidor.")
 @app_commands.describe(id_origem="ID do servidor de origem")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def cmd_clonar_emojis(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
         return
@@ -369,7 +369,7 @@ async def cmd_clonar_emojis(interaction: discord.Interaction, id_origem: str):
 
 @bot.tree.command(name="apagar_categoria", description="Apaga uma categoria inteira e todos os canais contidos nela.")
 @app_commands.describe(categoria="Selecione a categoria para apagar com todos os seus canais")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def cmd_apagar_categoria(interaction: discord.Interaction, categoria: discord.CategoryChannel):
     if not await check_admin_permission(interaction):
         return
@@ -403,7 +403,7 @@ async def cmd_apagar_categoria(interaction: discord.Interaction, categoria: disc
 
 
 @bot.tree.command(name="limpar_canais", description="🚨 Reseta o servidor: Apaga TODOS os canais existentes.")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def cmd_limpar_canais(interaction: discord.Interaction):
     if not await check_admin_permission(interaction):
         return
@@ -420,7 +420,6 @@ async def cmd_limpar_canais(interaction: discord.Interaction):
     await view.wait()
 
     if view.value:
-        # Cria um canal de log temporário para o bot poder responder
         temp_ch = await guild.create_text_channel(name="suporte-reset", reason="Canal temporário durante reset")
         for ch in list(guild.channels):
             if ch.id == temp_ch.id:
@@ -434,7 +433,7 @@ async def cmd_limpar_canais(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="limpar_cargos", description="🚨 Apaga todos os cargos personalizados do servidor.")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def cmd_limpar_cargos(interaction: discord.Interaction):
     if not await check_admin_permission(interaction):
         return
@@ -460,6 +459,58 @@ async def cmd_limpar_cargos(interaction: discord.Interaction):
             except Exception:
                 pass
         await interaction.followup.send(f"✅ Reset concluído! {deleted} cargos foram excluídos.", ephemeral=True)
+
+
+# =====================================================================
+#  COMANDO DE PREFIXO DE FALLBACK (!setup e !sync)
+# =====================================================================
+@bot.command(name="setup")
+async def prefix_setup(ctx: commands.Context):
+    """Comando alternativo via prefixo !setup se o Discord demorar para carregar os slash commands."""
+    if ctx.author.id != ctx.guild.owner_id and not ctx.author.guild_permissions.administrator:
+        return await ctx.reply("⛔ Acesso negado. Apenas o Dono ou Administradores podem usar.")
+
+    guild = ctx.guild
+    bot_member = guild.me
+    is_top = (bot_member.top_role.position >= guild.roles[-1].position)
+
+    embed = discord.Embed(
+        title="🛡️ ServerManager — Status do Bot (!setup)",
+        description="Bot ativo e conectado!",
+        color=0x335FFF
+    )
+    embed.add_field(name="Servidor", value=guild.name, inline=True)
+    embed.add_field(name="Cargo no Topo?", value="✅ Sim" if is_top else "⚠️ Suba o cargo do bot para o topo!", inline=True)
+    embed.add_field(name="Comandos", value="Use `/setup` para ver todos os comandos Slash ou digite `!sync` para forçar o carregamento imediato dos comandos.", inline=False)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="sync")
+async def prefix_sync(ctx: commands.Context):
+    """Força sincronização imediata dos Slash Commands no servidor atual."""
+    if ctx.author.id != ctx.guild.owner_id and not ctx.author.guild_permissions.administrator:
+        return await ctx.reply("⛔ Acesso negado.")
+
+    msg = await ctx.reply("⏳ Sincronizando comandos slash neste servidor...")
+    try:
+        bot.tree.copy_global_to(guild=ctx.guild)
+        synced = await bot.tree.sync(guild=ctx.guild)
+        await msg.edit(content=f"✅ Sincronizados {len(synced)} comandos slash com sucesso neste servidor! Pressione `Ctrl + R` no seu Discord se ainda não aparecerem.")
+    except Exception as e:
+        await msg.edit(content=f"❌ Erro ao sincronizar: {e}")
+
+
+# =====================================================================
+#  TRATAMENTO GLOBAL DE ERROS DE COMANDOS
+# =====================================================================
+@bot.tree.error
+async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    logger.error(f"Erro em comando: {error}")
+    err_text = f"⚠️ Ocorreu um erro ao executar este comando: `{error}`"
+    if interaction.response.is_done():
+        await interaction.followup.send(err_text, ephemeral=True)
+    else:
+        await interaction.response.send_message(err_text, ephemeral=True)
 
 
 # =====================================================================
@@ -493,36 +544,41 @@ async def start_web_server():
 async def on_ready():
     logger.info(f"Bot conectado como {bot.user} (ID: {bot.user.id})")
     
-    # 1. Atualiza o avatar do bot se houver 'avatar.jpg' na pasta
-    avatar_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatar.jpg")
-    if os.path.exists(avatar_file):
+    # Sincroniza os comandos Slash em cada servidor individualmente (instantâneo!)
+    for guild in bot.guilds:
         try:
-            with open(avatar_file, "rb") as f:
-                avatar_bytes = f.read()
-            await bot.user.edit(avatar=avatar_bytes)
-            logger.info("Avatar do bot atualizado com sucesso!")
-        except discord.HTTPException as e:
-            logger.warning(f"Aviso de taxa de limite para avatar (Discord permite 2 por 10min): {e}")
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+            logger.info(f"Comandos sincronizados instantaneamente no servidor: {guild.name}")
         except Exception as e:
-            logger.warning(f"Não foi possível atualizar avatar automaticamente: {e}")
+            logger.warning(f"Erro ao sincronizar na guild {guild.name}: {e}")
 
-    # 2. Sincroniza os comandos Slash globalmente
+    # Sincroniza globalmente também
     try:
-        synced = await bot.tree.sync()
-        logger.info(f"Sincronizados {len(synced)} comandos Slash com sucesso!")
-    except Exception as e:
-        logger.error(f"Erro ao sincronizar comandos: {e}")
+        await bot.tree.sync()
+    except Exception:
+        pass
 
-    # 3. Inicia o web server para o Render/Railway
     try:
         await start_web_server()
     except Exception as e:
-        logger.warning(f"Aviso ao iniciar web server: {e}")
+        logger.warning(f"Web server warning: {e}")
 
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="seus servidores | /setup"),
         status=discord.Status.online
     )
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Ao entrar em um novo servidor, sincroniza os comandos instantaneamente nele."""
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        logger.info(f"Comandos sincronizados no novo servidor: {guild.name}")
+    except Exception as e:
+        logger.warning(f"Erro ao sincronizar novo servidor: {e}")
 
 
 def run():
