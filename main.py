@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import secrets
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -83,6 +84,82 @@ intents.emojis = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# =====================================================================
+#  DETECÇÃO DE CARGOS COSMÉTICOS DE CORES (PALETAS / COLOR BOTS)
+# =====================================================================
+CSS_COLOR_NAMES = {
+    # 140+ Cores Oficiais Web/CSS
+    "aliceblue", "antiquewhite", "aqua", "aquamarine", "azure", "beige", "bisque", "black",
+    "blanchedalmond", "blue", "blueviolet", "brown", "burlywood", "cadetblue", "chartreuse",
+    "chocolate", "coral", "cornflowerblue", "cornsilk", "crimson", "crimsom", "cyan", "darkblue",
+    "darkcyan", "darkgoldenrod", "darkgray", "darkgrey", "darkgreen", "darkkhaki", "darkmagenta",
+    "darkolivegreen", "darkorange", "darkorchid", "darkred", "darksalmon", "darkseagreen",
+    "darkslateblue", "darkslategray", "darkslategrey", "darkturquoise", "darkviolet", "deeppink",
+    "deepskyblue", "dimgray", "dimgrey", "dodgerblue", "firebrick", "floralwhite", "forestgreen",
+    "fuchsia", "gainsboro", "ghostwhite", "gold", "goldenrod", "gray", "grey", "green", "greenyellow",
+    "honeydew", "hotpink", "indianred", "indigo", "ivory", "khaki", "lavender", "lavenderblush",
+    "lawngreen", "lemonchiffon", "lightblue", "lightcoral", "lightcyan", "lightgoldenrodyellow",
+    "lightgray", "lightgrey", "lightgreen", "lightpink", "lightsalmon", "lightseagreen", "lightskyblue",
+    "lightslategray", "lightslategrey", "lightsteelblue", "lightyellow", "lime", "limegreen", "linen",
+    "magenta", "maroon", "mediumaquamarine", "mediumblue", "mediumorchid", "mediumpurple",
+    "mediumseagreen", "mediumslateblue", "mediumspringgreen", "mediumturquoise", "mediumvioletred",
+    "midnightblue", "mintcream", "mistyrose", "moccasin", "navajowhite", "navy", "oldlace", "olive",
+    "olivedrab", "orange", "orangered", "orchid", "palegoldenrod", "palegreen", "paleturquoise",
+    "palevioletred", "papayawhip", "peachpuff", "peru", "pink", "plum", "powderblue", "purple",
+    "rebeccapurple", "red", "rosybrown", "royalblue", "saddlebrown", "salmon", "sandybrown",
+    "seagreen", "seashell", "sienna", "silver", "skyblue", "slateblue", "slategray", "slategrey",
+    "snow", "springgreen", "steelblue", "tan", "teal", "thistle", "tomato", "turquoise", "violet",
+    "wheat", "white", "whitesmoke", "yellow", "yellowgreen",
+    # Português
+    "azul", "vermelho", "verde", "amarelo", "rosa", "roxo", "laranja", "marrom", "cinza",
+    "preto", "branco", "ciano", "lilas", "lilás", "turquesa", "vinho", "bege", "dourado",
+    "prata", "salmao", "salmão", "coral"
+}
+
+def is_color_role(role: discord.Role) -> bool:
+    """Verifica se um cargo é puramente um cargo cosmético de cor (sem permissões operacionais)."""
+    if not role or role.is_default() or role.managed:
+        return False
+
+    # Regra de Segurança: Nunca toca em cargos com qualquer permissão elevada/operacional
+    elevated_perms = (
+        discord.Permissions.administrator.flag
+        | discord.Permissions.manage_guild.flag
+        | discord.Permissions.manage_roles.flag
+        | discord.Permissions.manage_channels.flag
+        | discord.Permissions.kick_members.flag
+        | discord.Permissions.ban_members.flag
+        | discord.Permissions.manage_messages.flag
+        | discord.Permissions.mention_everyone.flag
+        | discord.Permissions.moderate_members.flag
+        | discord.Permissions.manage_webhooks.flag
+        | discord.Permissions.view_audit_log.flag
+    )
+    if (role.permissions.value & elevated_perms) != 0:
+        return False
+
+    # Deve ter uma cor personalizada atribuída (diferente de default #000000)
+    if role.color.value == 0:
+        return False
+
+    cleaned_name = re.sub(r"[^a-zA-Z0-9áéíóúãõâêîôûàç]", "", role.name).lower()
+
+    # 1. Nome do cargo bate com nomes de cores padrão
+    if cleaned_name in CSS_COLOR_NAMES:
+        return True
+
+    # 2. Formato Hexadecimal de cor (ex: #FF5733 ou FF5733)
+    if re.fullmatch(r"^[0-9a-f]{6}$", cleaned_name):
+        return True
+
+    # 3. Padrões comuns de bots de cor (ex: "cor-azul", "color red", "c-pink", "cor: verde")
+    lower_raw = role.name.lower().strip()
+    if lower_raw.startswith(("color-", "cor-", "color ", "cor ", "c-", "cor:", "color:")):
+        return True
+
+    return False
 
 
 # =====================================================================
@@ -209,7 +286,7 @@ def build_overwrites(old_overwrites: dict, role_map: dict, target_guild: discord
     return new_overwrites
 
 
-async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord.Guild) -> tuple[dict, list[discord.Role]]:
+async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord.Guild, ignorar_cores: bool = False) -> tuple[dict, list[discord.Role]]:
     role_map = {source_guild.default_role: target_guild.default_role}
     try:
         await target_guild.default_role.edit(permissions=source_guild.default_role.permissions)
@@ -222,6 +299,8 @@ async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord
 
     created_roles = []
     for role in roles:
+        if ignorar_cores and is_color_role(role):
+            continue
         try:
             if role.name in existing_roles:
                 role_map[role] = existing_roles[role.name]
@@ -661,10 +740,11 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
             "• `/reverter` ou `!reverter` — ⏪ Desfaz a última clonagem/ação\n"
             "• `/gerar_id` ou `!gerar_id` — Gera um novo código secreto\n"
             "• `!sync` — Força registro imediato dos comandos /\n"
-            "• `/clonar_tudo <código>` — Clona tudo (exige código secreto)\n"
-            "• `/clonar_cargos <código>` — Clona só cargos\n"
+            "• `/clonar_tudo <código> [ignorar_cores]` — Clona tudo\n"
+            "• `/clonar_cargos <código> [ignorar_cores]` — Clona só cargos\n"
             "• `/clonar_canais <código>` — Clona só canais\n"
             "• `/clonar_emojis <código>` — Clona emojis\n"
+            "• `/limpar_cores` ou `!limpar_cores` — 🎨 Apaga cargos cosméticos de cor\n"
             "• `/apagar_categoria <categoria>` — Apaga categoria inteira\n"
             "• `/limpar_canais` — Reseta todos os canais\n"
             "• `/limpar_cargos` — Reseta todos os cargos"
@@ -706,9 +786,12 @@ async def cmd_gerar_id(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="clonar_tudo", description="Clona cargos, categorias, canais e emojis de outro servidor.")
-@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de onde você quer copiar")
+@app_commands.describe(
+    id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de onde você quer copiar",
+    ignorar_cores="Se True, não clona cargos cosméticos de cores (economiza limite de 250 cargos)"
+)
 @app_commands.default_permissions(administrator=True)
-async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
+async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str, ignorar_cores: bool = False):
     if not await check_admin_permission(interaction):
         return
 
@@ -726,6 +809,7 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
         f"⚠️ **Confirmar Clonagem Total**\n"
         f"Copiar de: **{source_guild.name}**\n"
         f"Para este servidor: **{target_guild.name}**\n"
+        f"Ignorar cargos de cores: {'**Sim**' if ignorar_cores else '**Não**'}\n"
         f"Isso criará cargos, categorias, canais e emojis idênticos.",
         view=view,
         ephemeral=True
@@ -734,7 +818,7 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
 
     if view.value:
         msg = await interaction.followup.send("🚀 [1/3] Iniciando clonagem de cargos...", ephemeral=True)
-        role_map, created_roles = await execute_clone_roles(source_guild, target_guild)
+        role_map, created_roles = await execute_clone_roles(source_guild, target_guild, ignorar_cores=ignorar_cores)
         roles_cnt = len(created_roles)
         await msg.edit(content=f"✅ Cargos clonados ({roles_cnt}).\n🚀 [2/3] Clonando categorias e canais...")
         created_cats, created_chs = await execute_clone_channels(source_guild, target_guild, role_map)
@@ -760,9 +844,12 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_cargos", description="Clona APENAS os cargos de outro servidor.")
-@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
+@app_commands.describe(
+    id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem",
+    ignorar_cores="Se True, não clona cargos cosméticos de cores (economiza limite de 250 cargos)"
+)
 @app_commands.default_permissions(administrator=True)
-async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
+async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str, ignorar_cores: bool = False):
     if not await check_admin_permission(interaction):
         return
 
@@ -771,7 +858,7 @@ async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
         return await interaction.response.send_message(f"❌ {err_msg}", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
-    _, created_roles = await execute_clone_roles(source_guild, interaction.guild)
+    _, created_roles = await execute_clone_roles(source_guild, interaction.guild, ignorar_cores=ignorar_cores)
     roles_cnt = len(created_roles)
 
     record_last_action(interaction.guild.id, {
@@ -994,6 +1081,73 @@ async def cmd_limpar_cargos(interaction: discord.Interaction):
         await interaction.followup.send(f"✅ Reset concluído! {deleted} cargos foram excluídos.\n💡 *Use `/reverter` para restaurá-los se desejar.*", ephemeral=True)
 
 
+@bot.tree.command(name="limpar_cores", description="🎨 Apaga apenas os cargos cosméticos de cores para liberar limite de 250 cargos.")
+@app_commands.default_permissions(administrator=True)
+async def cmd_limpar_cores(interaction: discord.Interaction):
+    if not await check_admin_permission(interaction):
+        return
+
+    guild = interaction.guild
+    color_roles = [r for r in guild.roles if is_color_role(r) and r < guild.me.top_role]
+
+    if not color_roles:
+        return await interaction.response.send_message(
+            "ℹ️ Nenhum cargo cosmético de cor foi encontrado neste servidor para remoção.",
+            ephemeral=True
+        )
+
+    view = ConfirmDangerAction(interaction.user.id, "Limpar Cargos de Cores")
+    preview_names = ", ".join([f"`{r.name}`" for r in color_roles[:8]])
+    if len(color_roles) > 8:
+        preview_names += f" e mais {len(color_roles) - 8}..."
+
+    await interaction.response.send_message(
+        f"🎨 **Confirmar Remoção de Cargos de Cores**\n"
+        f"Foram encontrados **{len(color_roles)} cargos cosméticos de cor** em **{guild.name}**.\n"
+        f"Exemplos identificados: {preview_names}\n\n"
+        f"*(Cargos com permissões de staff/moderação são 100% preservados e nunca apagados)*\n"
+        f"Deseja apagar todos esses cargos de cores para liberar espaço?",
+        view=view,
+        ephemeral=True
+    )
+    await view.wait()
+
+    if view.value:
+        snapshot_roles = [
+            {
+                "name": r.name,
+                "permissions": r.permissions.value,
+                "color": r.color.value,
+                "hoist": r.hoist,
+                "mentionable": r.mentionable
+            }
+            for r in color_roles
+        ]
+
+        deleted = 0
+        for r in color_roles:
+            try:
+                await r.delete(reason="Limpeza de cargos cosméticos de cor solicitada por administrador")
+                deleted += 1
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+        record_last_action(guild.id, {
+            "type": "limpar_cargos",
+            "name": "Limpeza de Cargos de Cores",
+            "details": f"{deleted} Cargos de cor removidos",
+            "snapshot_roles": snapshot_roles,
+            "timestamp": time.time(),
+            "author_id": interaction.user.id
+        })
+
+        await interaction.followup.send(
+            f"✅ **Limpeza Concluída!** {deleted} cargos cosméticos de cor foram excluídos com sucesso, liberando espaço no limite de 250 cargos.\n💡 *Use `/reverter` para restaurá-los se desejar.*",
+            ephemeral=True
+        )
+
+
 @bot.tree.command(name="reverter", description="Reverte a última ação executada no servidor (ex: desfaz clonagens ou exclusões).")
 @app_commands.default_permissions(administrator=True)
 async def cmd_reverter(interaction: discord.Interaction):
@@ -1076,19 +1230,20 @@ async def prefix_sync(ctx: commands.Context):
 
 
 @bot.command(name="clonar_tudo")
-async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None):
-    """Clona tudo via comando de prefixo !clonar_tudo <id ou código>."""
+async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None, ignorar_cores: str = "nao"):
+    """Clona tudo via comando de prefixo !clonar_tudo <id ou código> [ignorar_cores]."""
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_tudo <código ou id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_tudo <código ou id_do_servidor_origem> [sim/nao]`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
         return await ctx.reply(f"❌ {err_msg}")
 
-    msg = await ctx.reply(f"🚀 Iniciando clonagem completa de **{source_guild.name}**...")
-    role_map, created_roles = await execute_clone_roles(source_guild, ctx.guild)
+    ignorar = ignorar_cores.lower() in ("true", "1", "sim", "yes", "s", "ignorar")
+    msg = await ctx.reply(f"🚀 Iniciando clonagem completa de **{source_guild.name}** (ignorar cores: {'Sim' if ignorar else 'Não'})...")
+    role_map, created_roles = await execute_clone_roles(source_guild, ctx.guild, ignorar_cores=ignorar)
     roles_cnt = len(created_roles)
     created_cats, created_chs = await execute_clone_channels(source_guild, ctx.guild, role_map)
     cats_cnt = len(created_cats)
@@ -1112,18 +1267,19 @@ async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None):
 
 
 @bot.command(name="clonar_cargos")
-async def prefix_clonar_cargos(ctx: commands.Context, id_origem: str = None):
+async def prefix_clonar_cargos(ctx: commands.Context, id_origem: str = None, ignorar_cores: str = "nao"):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_cargos <código ou id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_cargos <código ou id_do_servidor_origem> [sim/nao]`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
         return await ctx.reply(f"❌ {err_msg}")
 
-    msg = await ctx.reply(f"🚀 Clonando cargos de **{source_guild.name}**...")
-    _, created_roles = await execute_clone_roles(source_guild, ctx.guild)
+    ignorar = ignorar_cores.lower() in ("true", "1", "sim", "yes", "s", "ignorar")
+    msg = await ctx.reply(f"🚀 Clonando cargos de **{source_guild.name}** (ignorar cores: {'Sim' if ignorar else 'Não'})...")
+    _, created_roles = await execute_clone_roles(source_guild, ctx.guild, ignorar_cores=ignorar)
     roles_cnt = len(created_roles)
 
     record_last_action(ctx.guild.id, {
@@ -1327,6 +1483,64 @@ async def prefix_limpar_cargos(ctx: commands.Context):
         })
 
         await ctx.reply(f"✅ Reset concluído! {deleted} cargos foram excluídos.\n💡 *Use `!reverter` para restaurá-los se desejar.*")
+
+
+@bot.command(name="limpar_cores")
+async def prefix_limpar_cores(ctx: commands.Context):
+    """Apaga apenas cargos cosméticos de cor via !limpar_cores."""
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado.")
+
+    color_roles = [r for r in ctx.guild.roles if is_color_role(r) and r < ctx.guild.me.top_role]
+    if not color_roles:
+        return await ctx.reply("ℹ️ Nenhum cargo cosmético de cor foi encontrado neste servidor para remoção.")
+
+    view = ConfirmDangerAction(ctx.author.id, "Limpar Cargos de Cores")
+    preview_names = ", ".join([f"`{r.name}`" for r in color_roles[:8]])
+    if len(color_roles) > 8:
+        preview_names += f" e mais {len(color_roles) - 8}..."
+
+    confirm_msg = await ctx.reply(
+        f"🎨 **Confirmar Remoção de Cargos de Cores**\n"
+        f"Foram encontrados **{len(color_roles)} cargos cosméticos de cor** em **{ctx.guild.name}**.\n"
+        f"Exemplos identificados: {preview_names}\n\n"
+        f"*(Cargos com permissões de staff/moderação são 100% preservados)*\n"
+        f"Deseja apagar todos esses cargos de cores para liberar espaço?",
+        view=view
+    )
+    await view.wait()
+
+    if view.value:
+        snapshot_roles = [
+            {
+                "name": r.name,
+                "permissions": r.permissions.value,
+                "color": r.color.value,
+                "hoist": r.hoist,
+                "mentionable": r.mentionable
+            }
+            for r in color_roles
+        ]
+
+        deleted = 0
+        for r in color_roles:
+            try:
+                await r.delete(reason="Limpeza de cargos cosméticos de cor via !limpar_cores")
+                deleted += 1
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+        record_last_action(ctx.guild.id, {
+            "type": "limpar_cargos",
+            "name": "Limpeza de Cargos de Cores",
+            "details": f"{deleted} Cargos de cor removidos",
+            "snapshot_roles": snapshot_roles,
+            "timestamp": time.time(),
+            "author_id": ctx.author.id
+        })
+
+        await ctx.reply(f"✅ **Limpeza Concluída!** {deleted} cargos de cores excluídos com sucesso.\n💡 *Use `!reverter` para restaurá-los se desejar.*")
 
 
 @bot.command(name="reverter")

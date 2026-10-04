@@ -187,5 +187,110 @@ class TestRevertSystem(unittest.IsolatedAsyncioTestCase):
         guild.create_category.assert_awaited_once_with(name="Comunidade", reason="Reversão de exclusão de categoria")
         guild.create_text_channel.assert_awaited_once()
 
+    def test_is_color_role_detection(self):
+        # 1. Cargos da screenshot do usuário e cores CSS válidas
+        for color_name in ["LightSalmon", "DarkSalmon", "Crimsom", "HotPink", "DeepPink", "Plum", "DarkRed"]:
+            role = MagicMock(spec=discord.Role)
+            role.is_default.return_value = False
+            role.managed = False
+            role.name = color_name
+            role.color = discord.Color(0xFF5555)
+            role.permissions = discord.Permissions(0)
+            self.assertTrue(main.is_color_role(role), f"Deveria detectar {color_name} como cargo de cor")
+
+        # 2. Formato Hexadecimal e prefixos
+        for hex_or_prefix in ["#ff5733", "00aabb", "cor-azul", "color red", "c-pink"]:
+            role = MagicMock(spec=discord.Role)
+            role.is_default.return_value = False
+            role.managed = False
+            role.name = hex_or_prefix
+            role.color = discord.Color(0x334455)
+            role.permissions = discord.Permissions(0)
+            self.assertTrue(main.is_color_role(role), f"Deveria detectar {hex_or_prefix} como cargo de cor")
+
+        # 3. SEGURANÇA: Cargo com mesmo nome de cor, mas com permissão de administrador ou staff
+        admin_role = MagicMock(spec=discord.Role)
+        admin_role.is_default.return_value = False
+        admin_role.managed = False
+        admin_role.name = "Crimson"
+        admin_role.color = discord.Color(0xDC143C)
+        admin_perms = discord.Permissions()
+        admin_perms.administrator = True
+        admin_role.permissions = admin_perms
+        self.assertFalse(main.is_color_role(admin_role), "NUNCA deve detectar cargo com permissões administrativas como cargo de cor!")
+
+        # 4. SEGURANÇA: Cargo sem cor atribuída (default 0)
+        no_color_role = MagicMock(spec=discord.Role)
+        no_color_role.is_default.return_value = False
+        no_color_role.managed = False
+        no_color_role.name = "Plum"
+        no_color_role.color = discord.Color(0)
+        no_color_role.permissions = discord.Permissions(0)
+        self.assertFalse(main.is_color_role(no_color_role), "Cargo sem cor personalizada não deve ser detectado")
+
+        # 5. Cargos normais de servidor (VIP, Dono, Moderador, Membro)
+        for normal_name in ["VIP", "Dono", "Moderador", "Membro", "Gamer"]:
+            role = MagicMock(spec=discord.Role)
+            role.is_default.return_value = False
+            role.managed = False
+            role.name = normal_name
+            role.color = discord.Color(0x123456)
+            role.permissions = discord.Permissions(0)
+            self.assertFalse(main.is_color_role(role), f"{normal_name} não deve ser detectado como cargo de cor")
+
+    async def test_clone_roles_ignorar_cores(self):
+        source_guild = MagicMock(spec=discord.Guild)
+        target_guild = MagicMock(spec=discord.Guild)
+        source_guild.name = "Origem"
+        target_guild.name = "Destino"
+        source_guild.default_role = MagicMock()
+        target_guild.default_role = MagicMock()
+        target_guild.default_role.edit = AsyncMock()
+
+        # Cria 1 cargo normal e 2 cargos de cor
+        role_normal = MagicMock(spec=discord.Role)
+        role_normal.name = "Membro VIP"
+        role_normal.position = 1
+        role_normal.managed = False
+        role_normal.is_default.return_value = False
+        role_normal.color = discord.Color(0x111111)
+        role_normal.permissions = discord.Permissions(0)
+        role_normal.hoist = False
+        role_normal.mentionable = False
+
+        role_color1 = MagicMock(spec=discord.Role)
+        role_color1.name = "HotPink"
+        role_color1.position = 2
+        role_color1.managed = False
+        role_color1.is_default.return_value = False
+        role_color1.color = discord.Color(0xFF69B4)
+        role_color1.permissions = discord.Permissions(0)
+        role_color1.hoist = False
+        role_color1.mentionable = False
+
+        role_color2 = MagicMock(spec=discord.Role)
+        role_color2.name = "LightSalmon"
+        role_color2.position = 3
+        role_color2.managed = False
+        role_color2.is_default.return_value = False
+        role_color2.color = discord.Color(0xFFA07A)
+        role_color2.permissions = discord.Permissions(0)
+        role_color2.hoist = False
+        role_color2.mentionable = False
+
+        source_guild.roles = [source_guild.default_role, role_normal, role_color1, role_color2]
+        target_guild.roles = [target_guild.default_role]
+
+        target_guild.create_role = AsyncMock(side_effect=lambda **kwargs: MagicMock(spec=discord.Role, name=kwargs.get("name")))
+
+        # Executa com ignorar_cores=True
+        role_map, created_roles = await main.execute_clone_roles(source_guild, target_guild, ignorar_cores=True)
+
+        self.assertEqual(len(created_roles), 1)
+        target_guild.create_role.assert_awaited_once()
+        call_kwargs = target_guild.create_role.await_args.kwargs
+        self.assertEqual(call_kwargs["name"], "Membro VIP")
+
 if __name__ == "__main__":
     unittest.main()
+
