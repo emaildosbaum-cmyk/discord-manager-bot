@@ -6,11 +6,22 @@ import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
+import secrets
+import aiohttp
 from aiohttp import web
 
 # Configuração de Logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DiscordManager")
+
+# Configuração Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ojjfwxjirlttpxcjhlho.supabase.co").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9qamZ3eGppcmx0dHB4Y2pobGhvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkyMjExMjcsImV4cCI6MjEwNDc5NzEyN30.QiBcBHLwS2yWbmgi_oAKSmRU1UEFNRXgfyLujmEK7XU")
+SUPABASE_TABLE = "discord_server_keys"
+
+# Caches de sincronização em memória
+_sync_code_cache = {}        # guild_id_str -> sync_code
+_code_to_server_cache = {}   # sync_code -> guild_id_int
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 def get_token():
@@ -291,12 +302,164 @@ async def get_owner_display(guild: discord.Guild) -> str:
     return "Não identificado"
 
 
+def _generate_random_code() -> str:
+    """Gera um código único e legível no formato SRV-XXXXXX"""
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    random_part = "".join(secrets.choice(chars) for _ in range(6))
+    return f"SRV-{random_part}"
+
+
+async def get_or_create_sync_code(guild: discord.Guild) -> str:
+    """Busca o código de sincronização no Supabase ou gera um novo e persiste."""
+    if not guild:
+        return "SRV-OFFLINE"
+
+    guild_id_str = str(guild.id)
+    if guild_id_str in _sync_code_cache:
+        return _sync_code_cache[guild_id_str]
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+
+    # 1. Verifica se já existe no Supabase
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?server_id=eq.{guild_id_str}"
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and len(data) > 0 and data[0].get("sync_code"):
+                        code = data[0]["sync_code"].upper()
+                        _sync_code_cache[guild_id_str] = code
+                        _code_to_server_cache[code] = guild.id
+                        return code
+    except Exception as e:
+        logger.warning(f"Aviso ao consultar Supabase para guild {guild.id}: {e}")
+
+    # 2. Gera novo código e salva no Supabase
+    new_code = _generate_random_code()
+    owner_id_str = str(guild.owner_id) if guild.owner_id else ""
+    payload = {
+        "server_id": guild_id_str,
+        "sync_code": new_code,
+        "server_name": guild.name,
+        "owner_id": owner_id_str
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                if resp.status in (200, 201):
+                    logger.info(f"Código {new_code} registrado no Supabase para servidor {guild.name}")
+    except Exception as e:
+        logger.warning(f"Aviso ao inserir código no Supabase: {e}")
+
+    _sync_code_cache[guild_id_str] = new_code
+    _code_to_server_cache[new_code] = guild.id
+    return new_code
+
+
+async def regenerate_sync_code(guild: discord.Guild) -> str:
+    """Regenera um novo código aleatório e atualiza no Supabase."""
+    new_code = _generate_random_code()
+    guild_id_str = str(guild.id)
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?server_id=eq.{guild_id_str}"
+            payload = {"sync_code": new_code, "server_name": guild.name}
+            async with session.patch(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                if resp.status in (200, 204):
+                    logger.info(f"Código atualizado no Supabase para {new_code}")
+    except Exception as e:
+        logger.warning(f"Erro ao regenerar código no Supabase: {e}")
+
+    _sync_code_cache[guild_id_str] = new_code
+    _code_to_server_cache[new_code] = guild.id
+    return new_code
+
+
+async def get_server_id_from_sync_code(sync_code: str) -> int | None:
+    """Busca o server_id correspondente ao código no Supabase ou cache."""
+    if not sync_code:
+        return None
+    code_upper = sync_code.strip().upper()
+    if code_upper in _code_to_server_cache:
+        return _code_to_server_cache[code_upper]
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?sync_code=eq.{code_upper}"
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and len(data) > 0 and data[0].get("server_id"):
+                        srv_id = int(data[0]["server_id"])
+                        _code_to_server_cache[code_upper] = srv_id
+                        _sync_code_cache[str(srv_id)] = code_upper
+                        return srv_id
+    except Exception as e:
+        logger.warning(f"Erro ao buscar código {code_upper} no Supabase: {e}")
+
+    return None
+
+
+async def resolve_source_guild(input_str: str) -> tuple[discord.Guild | None, str | None]:
+    """Resolve um servidor pelo ID numérico ou pelo código Supabase (ex: SRV-A4F9B2)."""
+    if not input_str:
+        return None, "Nenhum código ou ID fornecido."
+
+    cleaned = input_str.strip().upper()
+
+    # 1. Tenta buscar por código do Supabase
+    code_to_check = cleaned if cleaned.startswith("SRV-") else f"SRV-{cleaned}"
+    server_id = await get_server_id_from_sync_code(code_to_check)
+    if not server_id:
+        server_id = await get_server_id_from_sync_code(cleaned)
+
+    # 2. Se não encontrou por código e a entrada for numérica, usa como Guild ID do Discord
+    if not server_id and input_str.strip().isdigit():
+        server_id = int(input_str.strip())
+
+    if not server_id:
+        return None, f"Servidor ou Código `{input_str}` não encontrado. Use o código exibido no `/setup` do servidor de origem."
+
+    source_guild = bot.get_guild(int(server_id))
+    if not source_guild:
+        try:
+            source_guild = await bot.fetch_guild(int(server_id))
+        except Exception:
+            pass
+
+    if not source_guild:
+        return None, f"Servidor `{input_str}` localizado, mas o bot não está nele! Adicione o bot ao servidor de origem primeiro."
+
+    return source_guild, None
+
+
 async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
     """Gera o Embed de status do servidor de forma 100% segura contra erros."""
     bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
     is_top = check_bot_is_top(guild)
     is_admin = bot_member.guild_permissions.administrator if bot_member else False
     owner_str = await get_owner_display(guild)
+    sync_code = await get_or_create_sync_code(guild)
 
     embed = discord.Embed(
         title="🛡️ ServerManager — Painel de Controle",
@@ -304,6 +467,11 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
         color=0x335FFF
     )
     embed.add_field(name="📍 Servidor Atual", value=f"**{guild.name}** (`{guild.id}`)", inline=False)
+    embed.add_field(
+        name="🔑 ID de Clonagem (Supabase)",
+        value=f"**`{sync_code}`**\n*(Copie este código para clonar este servidor em outro!)*",
+        inline=False
+    )
     embed.add_field(name="👑 Dono do Servidor", value=owner_str, inline=True)
     embed.add_field(name="⚡ Permissão Admin", value="✅ Concedida" if is_admin else "❌ Ausente", inline=True)
     embed.add_field(name="📶 Posição no Topo", value="✅ No Topo dos Cargos" if is_top else "⚠️ Suba o cargo do bot para o topo!", inline=True)
@@ -315,14 +483,15 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
         name="📜 Comandos (Prefix ou Barra /)",
         value=(
             "• `/setup` ou `!setup` — Mostra este painel\n"
+            "• `/gerar_id` ou `!gerar_id` — Gera um novo código no Supabase\n"
             "• `!sync` — Força registro imediato dos comandos /\n"
-            "• `/clonar_tudo [id]` ou `!clonar_tudo <id>` — Clona tudo\n"
-            "• `/clonar_cargos [id]` ou `!clonar_cargos <id>` — Clona só cargos\n"
-            "• `/clonar_canais [id]` ou `!clonar_canais <id>` — Clona só canais\n"
-            "• `/clonar_emojis [id]` ou `!clonar_emojis <id>` — Clona emojis\n"
-            "• `/apagar_categoria` ou `!apagar_categoria <id_ou_nome>` — Apaga categoria inteira\n"
-            "• `/limpar_canais` ou `!limpar_canais` — Reseta canais\n"
-            "• `/limpar_cargos` ou `!limpar_cargos` — Reseta cargos"
+            "• `/clonar_tudo <código ou id>` — Clona tudo de outro server\n"
+            "• `/clonar_cargos <código ou id>` — Clona só cargos\n"
+            "• `/clonar_canais <código ou id>` — Clona só canais\n"
+            "• `/clonar_emojis <código ou id>` — Clona emojis\n"
+            "• `/apagar_categoria <categoria>` — Apaga categoria inteira\n"
+            "• `/limpar_canais` — Reseta todos os canais\n"
+            "• `/limpar_cargos` — Reseta todos os cargos"
         ),
         inline=False
     )
@@ -343,21 +512,30 @@ async def cmd_setup(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="gerar_id", description="Gera um novo código aleatório de clonagem para este servidor no Supabase.")
+@app_commands.default_permissions(administrator=True)
+async def cmd_gerar_id(interaction: discord.Interaction):
+    if not await check_admin_permission(interaction):
+        return
+    new_code = await regenerate_sync_code(interaction.guild)
+    await interaction.response.send_message(
+        f"✅ **Novo Código Gerado e Salvo no Supabase!**\n"
+        f"🔑 **`{new_code}`**\n"
+        f"*(Use `/clonar_tudo {new_code}` no outro servidor para copiá-lo)*",
+        ephemeral=True
+    )
+
+
 @bot.tree.command(name="clonar_tudo", description="Clona cargos, categorias, canais e emojis de outro servidor.")
-@app_commands.describe(id_origem="ID do servidor de onde você quer copiar")
+@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de onde você quer copiar")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
         return
 
-    try:
-        source_id = int(id_origem.strip())
-        source_guild = bot.get_guild(source_id)
-    except ValueError:
-        return await interaction.response.send_message("❌ ID do servidor inválido.", ephemeral=True)
-
-    if not source_guild:
-        return await interaction.response.send_message("❌ Servidor de origem não encontrado. O bot precisa estar adicionado nele!", ephemeral=True)
+    source_guild, err_msg = await resolve_source_guild(id_origem)
+    if err_msg:
+        return await interaction.response.send_message(f"❌ {err_msg}", ephemeral=True)
 
     if source_guild.id == interaction.guild_id:
         return await interaction.response.send_message("❌ O servidor de origem não pode ser o mesmo atual.", ephemeral=True)
@@ -386,20 +564,15 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_cargos", description="Clona APENAS os cargos de outro servidor.")
-@app_commands.describe(id_origem="ID do servidor de origem")
+@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
         return
 
-    try:
-        source_id = int(id_origem.strip())
-        source_guild = bot.get_guild(source_id)
-    except ValueError:
-        return await interaction.response.send_message("❌ ID inválido.", ephemeral=True)
-
-    if not source_guild:
-        return await interaction.response.send_message("❌ Servidor de origem não encontrado.", ephemeral=True)
+    source_guild, err_msg = await resolve_source_guild(id_origem)
+    if err_msg:
+        return await interaction.response.send_message(f"❌ {err_msg}", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
     _, roles_cnt = await execute_clone_roles(source_guild, interaction.guild)
@@ -407,20 +580,15 @@ async def cmd_clonar_cargos(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_canais", description="Clona APENAS as categorias e canais de outro servidor.")
-@app_commands.describe(id_origem="ID do servidor de origem")
+@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
         return
 
-    try:
-        source_id = int(id_origem.strip())
-        source_guild = bot.get_guild(source_id)
-    except ValueError:
-        return await interaction.response.send_message("❌ ID inválido.", ephemeral=True)
-
-    if not source_guild:
-        return await interaction.response.send_message("❌ Servidor de origem não encontrado.", ephemeral=True)
+    source_guild, err_msg = await resolve_source_guild(id_origem)
+    if err_msg:
+        return await interaction.response.send_message(f"❌ {err_msg}", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
     cats_cnt, chs_cnt = await execute_clone_channels(source_guild, interaction.guild)
@@ -428,20 +596,15 @@ async def cmd_clonar_canais(interaction: discord.Interaction, id_origem: str):
 
 
 @bot.tree.command(name="clonar_emojis", description="Clona os emojis de outro servidor.")
-@app_commands.describe(id_origem="ID do servidor de origem")
+@app_commands.describe(id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de origem")
 @app_commands.default_permissions(administrator=True)
 async def cmd_clonar_emojis(interaction: discord.Interaction, id_origem: str):
     if not await check_admin_permission(interaction):
         return
 
-    try:
-        source_id = int(id_origem.strip())
-        source_guild = bot.get_guild(source_id)
-    except ValueError:
-        return await interaction.response.send_message("❌ ID inválido.", ephemeral=True)
-
-    if not source_guild:
-        return await interaction.response.send_message("❌ Servidor não encontrado.", ephemeral=True)
+    source_guild, err_msg = await resolve_source_guild(id_origem)
+    if err_msg:
+        return await interaction.response.send_message(f"❌ {err_msg}", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
     count = await execute_clone_emojis(source_guild, interaction.guild)
@@ -555,6 +718,19 @@ async def prefix_setup(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
+@bot.command(name="gerar_id")
+async def prefix_gerar_id(ctx: commands.Context):
+    """Gera um novo código aleatório de clonagem para o servidor no Supabase."""
+    if not is_authorized_admin(ctx):
+        return await ctx.reply("⛔ Acesso negado.")
+    new_code = await regenerate_sync_code(ctx.guild)
+    await ctx.reply(
+        f"✅ **Novo Código Gerado e Salvo no Supabase!**\n"
+        f"🔑 **`{new_code}`**\n"
+        f"*(Use `!clonar_tudo {new_code}` no outro servidor para copiá-lo)*"
+    )
+
+
 @bot.command(name="sync")
 async def prefix_sync(ctx: commands.Context):
     """Sincroniza os comandos Slash no servidor atual."""
@@ -572,20 +748,15 @@ async def prefix_sync(ctx: commands.Context):
 
 @bot.command(name="clonar_tudo")
 async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None):
-    """Clona tudo via comando de prefixo !clonar_tudo <id>."""
+    """Clona tudo via comando de prefixo !clonar_tudo <id ou código>."""
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_tudo <id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_tudo <código ou id_do_servidor_origem>`")
 
-    try:
-        source_id = int(id_origem.strip())
-        source_guild = bot.get_guild(source_id)
-    except ValueError:
-        return await ctx.reply("❌ ID de servidor inválido.")
-
-    if not source_guild:
-        return await ctx.reply("❌ Servidor não encontrado. Certifique-se de que o bot está adicionado nele!")
+    source_guild, err_msg = await resolve_source_guild(id_origem)
+    if err_msg:
+        return await ctx.reply(f"❌ {err_msg}")
 
     msg = await ctx.reply(f"🚀 Iniciando clonagem completa de **{source_guild.name}**...")
     role_map, roles_cnt = await execute_clone_roles(source_guild, ctx.guild)
@@ -599,16 +770,11 @@ async def prefix_clonar_cargos(ctx: commands.Context, id_origem: str = None):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_cargos <id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_cargos <código ou id_do_servidor_origem>`")
 
-    try:
-        source_id = int(id_origem.strip())
-        source_guild = bot.get_guild(source_id)
-    except ValueError:
-        return await ctx.reply("❌ ID inválido.")
-
-    if not source_guild:
-        return await ctx.reply("❌ Servidor não encontrado.")
+    source_guild, err_msg = await resolve_source_guild(id_origem)
+    if err_msg:
+        return await ctx.reply(f"❌ {err_msg}")
 
     msg = await ctx.reply(f"🚀 Clonando cargos de **{source_guild.name}**...")
     _, roles_cnt = await execute_clone_roles(source_guild, ctx.guild)
@@ -620,16 +786,11 @@ async def prefix_clonar_canais(ctx: commands.Context, id_origem: str = None):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_canais <id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_canais <código ou id_do_servidor_origem>`")
 
-    try:
-        source_id = int(id_origem.strip())
-        source_guild = bot.get_guild(source_id)
-    except ValueError:
-        return await ctx.reply("❌ ID inválido.")
-
-    if not source_guild:
-        return await ctx.reply("❌ Servidor não encontrado.")
+    source_guild, err_msg = await resolve_source_guild(id_origem)
+    if err_msg:
+        return await ctx.reply(f"❌ {err_msg}")
 
     msg = await ctx.reply(f"🚀 Clonando canais de **{source_guild.name}**...")
     cats_cnt, chs_cnt = await execute_clone_channels(source_guild, ctx.guild)
@@ -641,16 +802,11 @@ async def prefix_clonar_emojis(ctx: commands.Context, id_origem: str = None):
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_emojis <id_do_servidor_origem>`")
+        return await ctx.reply("❌ Use: `!clonar_emojis <código ou id_do_servidor_origem>`")
 
-    try:
-        source_id = int(id_origem.strip())
-        source_guild = bot.get_guild(source_id)
-    except ValueError:
-        return await ctx.reply("❌ ID inválido.")
-
-    if not source_guild:
-        return await ctx.reply("❌ Servidor não encontrado.")
+    source_guild, err_msg = await resolve_source_guild(id_origem)
+    if err_msg:
+        return await ctx.reply(f"❌ {err_msg}")
 
     msg = await ctx.reply(f"🚀 Clonando emojis de **{source_guild.name}**...")
     count = await execute_clone_emojis(source_guild, ctx.guild)
