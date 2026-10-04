@@ -401,11 +401,68 @@ async def execute_clone_emojis(source_guild: discord.Guild, target_guild: discor
     return created_emojis
 
 
+async def execute_wipe_guild(guild: discord.Guild) -> tuple[list[dict], list[dict], discord.TextChannel | None]:
+    """Limpa canais, categorias, cargos personalizados e emojis do servidor de forma segura."""
+    # 1. Snapshot dos cargos e exclusão
+    my_top_pos = guild.me.top_role.position if (guild.me and guild.me.top_role) else 999999
+    roles_to_del = [r for r in guild.roles if not r.is_default() and not r.managed and getattr(r, "position", 0) < my_top_pos]
+    snapshot_roles = [
+        {
+            "name": r.name,
+            "permissions": r.permissions.value,
+            "color": r.color.value,
+            "hoist": r.hoist,
+            "mentionable": r.mentionable
+        }
+        for r in roles_to_del
+    ]
+    for r in roles_to_del:
+        try:
+            await r.delete(reason="Limpeza prévia para clonagem total")
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+    # 2. Snapshot dos canais, criação de canal temp e exclusão dos demais
+    snapshot_channels = [
+        {
+            "name": ch.name,
+            "type": "voice" if isinstance(ch, discord.VoiceChannel) else ("category" if isinstance(ch, discord.CategoryChannel) else "text"),
+            "topic": getattr(ch, "topic", None)
+        }
+        for ch in guild.channels
+    ]
+    temp_ch = None
+    try:
+        temp_ch = await guild.create_text_channel(name="suporte-clonagem", reason="Canal temporário durante clonagem e limpeza")
+    except Exception:
+        pass
+
+    for ch in list(guild.channels):
+        if temp_ch and ch.id == temp_ch.id:
+            continue
+        try:
+            await ch.delete(reason="Limpeza prévia para clonagem total")
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+    # 3. Exclusão de emojis existentes
+    for em in list(guild.emojis):
+        try:
+            await em.delete(reason="Limpeza prévia para clonagem total")
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+    return snapshot_roles, snapshot_channels, temp_ch
+
+
 async def execute_revert_action(guild: discord.Guild, action: dict) -> tuple[bool, str]:
     """Executa a reversão completa da ação com base no histórico."""
     act_type = action.get("type")
 
-    # 1. Reverter clonagens (apagar o que foi criado)
+    # 1. Reverter clonagens (apagar o que foi criado e opcionalmente restaurar o que existia antes)
     if act_type in ("clonar_tudo", "clonar_cargos", "clonar_canais", "clonar_emojis"):
         del_emojis = 0
         del_channels = 0
@@ -456,6 +513,41 @@ async def execute_revert_action(guild: discord.Guild, action: dict) -> tuple[boo
                 except Exception:
                     pass
 
+        # Se limpou antes da clonagem, restaura os itens que existiam originalmente
+        restored_roles = 0
+        restored_chs = 0
+        if action.get("limpou_antes"):
+            for r_info in action.get("snapshot_roles", []):
+                try:
+                    perms = discord.Permissions(r_info.get("permissions", 0))
+                    color = discord.Color(r_info.get("color", 0))
+                    await guild.create_role(
+                        name=r_info["name"],
+                        permissions=perms,
+                        color=color,
+                        hoist=r_info.get("hoist", False),
+                        mentionable=r_info.get("mentionable", False),
+                        reason="Reversão de clonagem (restauração de cargos antigos)"
+                    )
+                    restored_roles += 1
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+
+            for ch_info in action.get("snapshot_channels", []):
+                try:
+                    ch_type = ch_info.get("type", "text")
+                    if ch_type == "voice":
+                        await guild.create_voice_channel(name=ch_info["name"], reason="Reversão de clonagem")
+                    elif ch_type == "category":
+                        await guild.create_category(name=ch_info["name"], reason="Reversão de clonagem")
+                    else:
+                        await guild.create_text_channel(name=ch_info["name"], topic=ch_info.get("topic"), reason="Reversão de clonagem")
+                    restored_chs += 1
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+
         report = []
         if del_roles > 0:
             report.append(f"• {del_roles} Cargos removidos")
@@ -465,8 +557,12 @@ async def execute_revert_action(guild: discord.Guild, action: dict) -> tuple[boo
             report.append(f"• {del_channels} Canais removidos")
         if del_emojis > 0:
             report.append(f"• {del_emojis} Emojis removidos")
+        if restored_roles > 0:
+            report.append(f"• {restored_roles} Cargos anteriores restaurados")
+        if restored_chs > 0:
+            report.append(f"• {restored_chs} Canais anteriores restaurados")
 
-        summary = "\n".join(report) if report else "Nenhum dos itens criados foi localizado (podem já ter sido apagados)."
+        summary = "\n".join(report) if report else "Nenhum item alterado foi localizado."
         return True, f"⏪ **Reversão de Clonagem Concluída com Sucesso!**\n{summary}"
 
     # 2. Reverter reset de cargos (restaurar os cargos a partir do snapshot)
@@ -740,8 +836,8 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
             "• `/reverter` ou `!reverter` — ⏪ Desfaz a última clonagem/ação\n"
             "• `/gerar_id` ou `!gerar_id` — Gera um novo código secreto\n"
             "• `!sync` — Força registro imediato dos comandos /\n"
-            "• `/clonar_tudo <código> [ignorar_cores]` — Clona tudo\n"
-            "• `/clonar_cargos <código> [ignorar_cores]` — Clona só cargos\n"
+            "• `/clonar_tudo <código>` — 🚀 Clona tudo (limpa antes por padrão)\n"
+            "• `/clonar_cargos <código>` — Clona só cargos\n"
             "• `/clonar_canais <código>` — Clona só canais\n"
             "• `/clonar_emojis <código>` — Clona emojis\n"
             "• `/limpar_cores` ou `!limpar_cores` — 🎨 Apaga cargos cosméticos de cor\n"
@@ -788,10 +884,11 @@ async def cmd_gerar_id(interaction: discord.Interaction):
 @bot.tree.command(name="clonar_tudo", description="Clona cargos, categorias, canais e emojis de outro servidor.")
 @app_commands.describe(
     id_origem="Código (ex: SRV-XXXXXX) ou ID do servidor de onde você quer copiar",
+    limpar_antes="Se True (padrão), limpa todos os canais e cargos existentes antes de clonar",
     ignorar_cores="Se True, não clona cargos cosméticos de cores (economiza limite de 250 cargos)"
 )
 @app_commands.default_permissions(administrator=True)
-async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str, ignorar_cores: bool = False):
+async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str, limpar_antes: bool = True, ignorar_cores: bool = False):
     if not await check_admin_permission(interaction):
         return
 
@@ -809,38 +906,99 @@ async def cmd_clonar_tudo(interaction: discord.Interaction, id_origem: str, igno
         f"⚠️ **Confirmar Clonagem Total**\n"
         f"Copiar de: **{source_guild.name}**\n"
         f"Para este servidor: **{target_guild.name}**\n"
-        f"Ignorar cargos de cores: {'**Sim**' if ignorar_cores else '**Não**'}\n"
-        f"Isso criará cargos, categorias, canais e emojis idênticos.",
+        f"Limpeza prévia: {'**Sim (apagará canais e cargos existentes antes)**' if limpar_antes else '**Não**'}\n"
+        f"Ignorar cargos de cores: {'**Sim**' if ignorar_cores else '**Não**'}\n\n"
+        f"Isso criará uma estrutura idêntica à de **{source_guild.name}**.",
         view=view,
         ephemeral=True
     )
     await view.wait()
 
     if view.value:
-        msg = await interaction.followup.send("🚀 [1/3] Iniciando clonagem de cargos...", ephemeral=True)
+        msg = await interaction.followup.send("🚀 Iniciando processo de clonagem...", ephemeral=True)
+
+        snapshot_roles = []
+        snapshot_channels = []
+        temp_ch = None
+
+        if limpar_antes:
+            try:
+                await msg.edit(content="🧹 [1/4] Limpando canais, categorias e cargos existentes...")
+            except Exception:
+                pass
+            snapshot_roles, snapshot_channels, temp_ch = await execute_wipe_guild(target_guild)
+
+        try:
+            await msg.edit(content=f"{'🧹 Servidor limpo.\n' if limpar_antes else ''}🚀 [{'2/4' if limpar_antes else '1/3'}] Clonando cargos...")
+        except Exception:
+            pass
+
         role_map, created_roles = await execute_clone_roles(source_guild, target_guild, ignorar_cores=ignorar_cores)
         roles_cnt = len(created_roles)
-        await msg.edit(content=f"✅ Cargos clonados ({roles_cnt}).\n🚀 [2/3] Clonando categorias e canais...")
+
+        try:
+            await msg.edit(content=f"✅ Cargos clonados ({roles_cnt}).\n🚀 [{'3/4' if limpar_antes else '2/3'}] Clonando categorias e canais...")
+        except Exception:
+            pass
+
         created_cats, created_chs = await execute_clone_channels(source_guild, target_guild, role_map)
         cats_cnt = len(created_cats)
         chs_cnt = len(created_chs)
-        await msg.edit(content=f"✅ Cargos ({roles_cnt}) e Canais ({chs_cnt}) clonados.\n🚀 [3/3] Clonando emojis...")
+
+        if temp_ch:
+            try:
+                await temp_ch.delete(reason="Removendo canal temporário após clonagem")
+            except Exception:
+                pass
+
+        try:
+            await msg.edit(content=f"✅ Cargos ({roles_cnt}) e Canais ({chs_cnt}) clonados.\n🚀 [{'4/4' if limpar_antes else '3/3'}] Clonando emojis...")
+        except Exception:
+            pass
+
         created_emojis = await execute_clone_emojis(source_guild, target_guild)
         emojis_cnt = len(created_emojis)
 
         record_last_action(target_guild.id, {
             "type": "clonar_tudo",
             "name": f"Clonagem Completa (de {source_guild.name})",
-            "details": f"{roles_cnt} Cargos, {cats_cnt} Categorias, {chs_cnt} Canais, {emojis_cnt} Emojis",
+            "details": f"{roles_cnt} Cargos, {cats_cnt} Categorias, {chs_cnt} Canais, {emojis_cnt} Emojis{' (com limpeza prévia)' if limpar_antes else ''}",
             "created_role_ids": [r.id for r in created_roles],
             "created_category_ids": [c.id for c in created_cats],
             "created_channel_ids": [c.id for c in created_chs],
             "created_emoji_ids": [e.id for e in created_emojis],
+            "limpou_antes": limpar_antes,
+            "snapshot_roles": snapshot_roles,
+            "snapshot_channels": snapshot_channels,
             "timestamp": time.time(),
             "author_id": interaction.user.id
         })
 
-        await msg.edit(content=f"🎉 **Clonagem Completa Concluída!**\n• {roles_cnt} Cargos\n• {cats_cnt} Categorias\n• {chs_cnt} Canais\n• {emojis_cnt} Emojis\n\n💡 *Dica: Se precisar desfazer tudo, use `/reverter` ou `!reverter`.*")
+        success_text = (
+            f"🎉 **Clonagem Completa Concluída com Sucesso!**\n"
+            f"{'• 🧹 Servidor limpo previamente (canais e cargos anteriores removidos)\n' if limpar_antes else ''}"
+            f"• 👥 **{roles_cnt}** Cargos clonados\n"
+            f"• 📁 **{cats_cnt}** Categorias clonadas\n"
+            f"• 💬 **{chs_cnt}** Canais clonados\n"
+            f"• 😀 **{emojis_cnt}** Emojis clonados\n\n"
+            f"💡 *Dica: Se precisar desfazer tudo, use `/reverter` ou `!reverter`.*"
+        )
+
+        try:
+            await msg.edit(content=success_text)
+        except Exception:
+            pass
+
+        notify_channel = None
+        for ch in created_chs:
+            if isinstance(ch, discord.TextChannel):
+                notify_channel = ch
+                break
+        if notify_channel:
+            try:
+                await notify_channel.send(success_text)
+            except Exception:
+                pass
 
 
 @bot.tree.command(name="clonar_cargos", description="Clona APENAS os cargos de outro servidor.")
@@ -1230,40 +1388,105 @@ async def prefix_sync(ctx: commands.Context):
 
 
 @bot.command(name="clonar_tudo")
-async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None, ignorar_cores: str = "nao"):
-    """Clona tudo via comando de prefixo !clonar_tudo <id ou código> [ignorar_cores]."""
+async def prefix_clonar_tudo(ctx: commands.Context, id_origem: str = None, limpar_antes: str = "sim", ignorar_cores: str = "nao"):
+    """Clona tudo via comando de prefixo !clonar_tudo <id ou código> [limpar_antes=sim] [ignorar_cores=nao]."""
     if not is_authorized_admin(ctx):
         return await ctx.reply("⛔ Acesso negado.")
     if not id_origem:
-        return await ctx.reply("❌ Use: `!clonar_tudo <código ou id_do_servidor_origem> [sim/nao]`")
+        return await ctx.reply("❌ Use: `!clonar_tudo <código ou id_do_servidor_origem> [limpar: sim/nao] [ignorar_cores: sim/nao]`")
 
     source_guild, err_msg = await resolve_source_guild(id_origem)
     if err_msg:
         return await ctx.reply(f"❌ {err_msg}")
 
+    limpar = limpar_antes.lower() in ("true", "1", "sim", "yes", "s", "limpar")
     ignorar = ignorar_cores.lower() in ("true", "1", "sim", "yes", "s", "ignorar")
-    msg = await ctx.reply(f"🚀 Iniciando clonagem completa de **{source_guild.name}** (ignorar cores: {'Sim' if ignorar else 'Não'})...")
-    role_map, created_roles = await execute_clone_roles(source_guild, ctx.guild, ignorar_cores=ignorar)
+
+    target_guild = ctx.guild
+    msg = await ctx.reply(f"🚀 Iniciando clonagem de **{source_guild.name}** (limpar tudo antes: {'Sim' if limpar else 'Não'}, ignorar cores: {'Sim' if ignorar else 'Não'})...")
+
+    snapshot_roles = []
+    snapshot_channels = []
+    temp_ch = None
+
+    if limpar:
+        try:
+            await msg.edit(content="🧹 [1/4] Limpando canais, categorias e cargos existentes...")
+        except Exception:
+            pass
+        snapshot_roles, snapshot_channels, temp_ch = await execute_wipe_guild(target_guild)
+
+    try:
+        await msg.edit(content=f"{'🧹 Servidor limpo.\n' if limpar else ''}🚀 [{'2/4' if limpar else '1/3'}] Clonando cargos...")
+    except Exception:
+        pass
+
+    role_map, created_roles = await execute_clone_roles(source_guild, target_guild, ignorar_cores=ignorar)
     roles_cnt = len(created_roles)
-    created_cats, created_chs = await execute_clone_channels(source_guild, ctx.guild, role_map)
+
+    try:
+        await msg.edit(content=f"✅ Cargos clonados ({roles_cnt}).\n🚀 [{'3/4' if limpar else '2/3'}] Clonando categorias e canais...")
+    except Exception:
+        pass
+
+    created_cats, created_chs = await execute_clone_channels(source_guild, target_guild, role_map)
     cats_cnt = len(created_cats)
     chs_cnt = len(created_chs)
-    created_emojis = await execute_clone_emojis(source_guild, ctx.guild)
+
+    if temp_ch:
+        try:
+            await temp_ch.delete(reason="Removendo canal temporário após clonagem")
+        except Exception:
+            pass
+
+    try:
+        await msg.edit(content=f"✅ Cargos ({roles_cnt}) e Canais ({chs_cnt}) clonados.\n🚀 [{'4/4' if limpar else '3/3'}] Clonando emojis...")
+    except Exception:
+        pass
+
+    created_emojis = await execute_clone_emojis(source_guild, target_guild)
     emojis_cnt = len(created_emojis)
 
-    record_last_action(ctx.guild.id, {
+    record_last_action(target_guild.id, {
         "type": "clonar_tudo",
         "name": f"Clonagem Completa (de {source_guild.name})",
-        "details": f"{roles_cnt} Cargos, {cats_cnt} Categorias, {chs_cnt} Canais, {emojis_cnt} Emojis",
+        "details": f"{roles_cnt} Cargos, {cats_cnt} Categorias, {chs_cnt} Canais, {emojis_cnt} Emojis{' (com limpeza prévia)' if limpar else ''}",
         "created_role_ids": [r.id for r in created_roles],
         "created_category_ids": [c.id for c in created_cats],
         "created_channel_ids": [c.id for c in created_chs],
         "created_emoji_ids": [e.id for e in created_emojis],
+        "limpou_antes": limpar,
+        "snapshot_roles": snapshot_roles,
+        "snapshot_channels": snapshot_channels,
         "timestamp": time.time(),
         "author_id": ctx.author.id
     })
 
-    await msg.edit(content=f"🎉 **Clonagem Concluída!**\n• {roles_cnt} Cargos\n• {cats_cnt} Categorias\n• {chs_cnt} Canais\n• {emojis_cnt} Emojis\n\n💡 *Dica: Se precisar desfazer, use `!reverter` ou `/reverter`.*")
+    success_text = (
+        f"🎉 **Clonagem Concluída com Sucesso!**\n"
+        f"{'• 🧹 Servidor limpo previamente (canais e cargos anteriores removidos)\n' if limpar else ''}"
+        f"• 👥 **{roles_cnt}** Cargos\n"
+        f"• 📁 **{cats_cnt}** Categorias\n"
+        f"• 💬 **{chs_cnt}** Canais\n"
+        f"• 😀 **{emojis_cnt}** Emojis\n\n"
+        f"💡 *Dica: Se precisar desfazer, use `!reverter` ou `/reverter`.*"
+    )
+
+    try:
+        await msg.edit(content=success_text)
+    except Exception:
+        pass
+
+    notify_channel = None
+    for ch in created_chs:
+        if isinstance(ch, discord.TextChannel):
+            notify_channel = ch
+            break
+    if notify_channel:
+        try:
+            await notify_channel.send(success_text)
+        except Exception:
+            pass
 
 
 @bot.command(name="clonar_cargos")

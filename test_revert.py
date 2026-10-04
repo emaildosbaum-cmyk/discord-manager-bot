@@ -291,6 +291,94 @@ class TestRevertSystem(unittest.IsolatedAsyncioTestCase):
         call_kwargs = target_guild.create_role.await_args.kwargs
         self.assertEqual(call_kwargs["name"], "Membro VIP")
 
+    async def test_execute_wipe_guild(self):
+        guild = MagicMock(spec=discord.Guild)
+        guild.default_role = MagicMock()
+        guild.me = MagicMock()
+        guild.me.top_role = MagicMock()
+        guild.me.top_role.position = 999
+
+        # Cargos
+        role1 = MagicMock(spec=discord.Role)
+        role1.name = "Role Antiga"
+        role1.position = 10
+        role1.managed = False
+        role1.is_default.return_value = False
+        role1.permissions.value = 0
+        role1.color.value = 0x112233
+        role1.hoist = False
+        role1.mentionable = False
+        role1.delete = AsyncMock()
+
+        guild.roles = [guild.default_role, role1]
+
+        # Canais
+        ch1 = MagicMock(spec=discord.TextChannel)
+        ch1.id = 111
+        ch1.name = "canal-antigo"
+        ch1.topic = "antigo"
+        ch1.delete = AsyncMock()
+
+        guild.channels = [ch1]
+
+        # Emojis
+        em1 = MagicMock(spec=discord.Emoji)
+        em1.delete = AsyncMock()
+        guild.emojis = [em1]
+
+        temp_ch = MagicMock(spec=discord.TextChannel)
+        temp_ch.id = 999
+        guild.create_text_channel = AsyncMock(return_value=temp_ch)
+
+        snap_roles, snap_chs, returned_temp = await main.execute_wipe_guild(guild)
+
+        self.assertEqual(len(snap_roles), 1)
+        self.assertEqual(snap_roles[0]["name"], "Role Antiga")
+        self.assertEqual(len(snap_chs), 1)
+        self.assertEqual(snap_chs[0]["name"], "canal-antigo")
+        self.assertEqual(returned_temp, temp_ch)
+
+        role1.delete.assert_awaited_once()
+        ch1.delete.assert_awaited_once()
+        em1.delete.assert_awaited_once()
+
+    async def test_revert_clonar_tudo_com_limpeza_previa(self):
+        guild = MagicMock(spec=discord.Guild)
+        guild.create_role = AsyncMock()
+        guild.create_text_channel = AsyncMock()
+
+        # Item clonado que deve ser apagado
+        cloned_role = MagicMock(spec=discord.Role)
+        cloned_role.delete = AsyncMock()
+        guild.get_role.return_value = cloned_role
+
+        action = {
+            "type": "clonar_tudo",
+            "name": "Clonagem Completa",
+            "created_role_ids": [101],
+            "created_category_ids": [],
+            "created_channel_ids": [],
+            "created_emoji_ids": [],
+            "limpou_antes": True,
+            "snapshot_roles": [
+                {"name": "Original Role", "permissions": 0, "color": 0xFF0000, "hoist": False, "mentionable": False}
+            ],
+            "snapshot_channels": [
+                {"name": "original-chat", "type": "text", "topic": "antigo"}
+            ]
+        }
+
+        success, result_text = await main.execute_revert_action(guild, action)
+        self.assertTrue(success)
+        self.assertIn("1 Cargos removidos", result_text)
+        self.assertIn("1 Cargos anteriores restaurados", result_text)
+        self.assertIn("1 Canais anteriores restaurados", result_text)
+
+        cloned_role.delete.assert_awaited_once()
+        guild.create_role.assert_awaited_once()
+        guild.create_text_channel.assert_awaited_once()
+
 if __name__ == "__main__":
     unittest.main()
+
 
