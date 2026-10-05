@@ -280,6 +280,10 @@ class TestRevertSystem(unittest.IsolatedAsyncioTestCase):
 
         source_guild.roles = [source_guild.default_role, role_normal, role_color1, role_color2]
         target_guild.roles = [target_guild.default_role]
+        target_guild.me = MagicMock()
+        target_guild.me.top_role = MagicMock()
+        target_guild.me.top_role.position = 999
+        target_guild.edit_role_positions = AsyncMock()
 
         target_guild.create_role = AsyncMock(side_effect=lambda **kwargs: MagicMock(spec=discord.Role, name=kwargs.get("name")))
 
@@ -290,6 +294,102 @@ class TestRevertSystem(unittest.IsolatedAsyncioTestCase):
         target_guild.create_role.assert_awaited_once()
         call_kwargs = target_guild.create_role.await_args.kwargs
         self.assertEqual(call_kwargs["name"], "Membro VIP")
+
+    async def test_clone_roles_creation_order(self):
+        source_guild = MagicMock(spec=discord.Guild)
+        target_guild = MagicMock(spec=discord.Guild)
+        source_guild.name = "Origem"
+        target_guild.name = "Destino"
+        source_guild.default_role = MagicMock()
+        target_guild.default_role = MagicMock()
+        target_guild.default_role.edit = AsyncMock()
+        target_guild.me = MagicMock()
+        target_guild.me.top_role = MagicMock()
+        target_guild.me.top_role.position = 999
+        target_guild.edit_role_positions = AsyncMock()
+
+        # 3 cargos com hierarquia: Membro (1), Mod (2), Dono (3)
+        r_membro = MagicMock(spec=discord.Role, name="Membro", position=1, managed=False)
+        r_membro.name = "Membro"
+        r_membro.is_default.return_value = False
+        r_membro.color = discord.Color(0)
+        r_membro.permissions = discord.Permissions(0)
+        r_membro.hoist = False
+        r_membro.mentionable = False
+
+        r_mod = MagicMock(spec=discord.Role, name="Mod", position=2, managed=False)
+        r_mod.name = "Mod"
+        r_mod.is_default.return_value = False
+        r_mod.color = discord.Color(0)
+        r_mod.permissions = discord.Permissions(0)
+        r_mod.hoist = False
+        r_mod.mentionable = False
+
+        r_dono = MagicMock(spec=discord.Role, name="Dono", position=3, managed=False)
+        r_dono.name = "Dono"
+        r_dono.is_default.return_value = False
+        r_dono.color = discord.Color(0)
+        r_dono.permissions = discord.Permissions(0)
+        r_dono.hoist = False
+        r_dono.mentionable = False
+
+        source_guild.roles = [source_guild.default_role, r_membro, r_mod, r_dono]
+        target_guild.roles = [target_guild.default_role]
+
+        created_history = []
+        async def mock_create_role(**kwargs):
+            mock_r = MagicMock(spec=discord.Role)
+            mock_r.name = kwargs["name"]
+            created_history.append(kwargs["name"])
+            return mock_r
+
+        target_guild.create_role = AsyncMock(side_effect=mock_create_role)
+
+        role_map, created_roles = await main.execute_clone_roles(source_guild, target_guild)
+
+        # Ordem de criacao DEVE ser decrescente (Dono -> Mod -> Membro)
+        # para que o push-up do Discord resulte em Dono no topo e Membro na base!
+        self.assertEqual(created_history, ["Dono", "Mod", "Membro"])
+        target_guild.edit_role_positions.assert_awaited_once()
+
+    async def test_check_bot_is_top_detection(self):
+        guild = MagicMock(spec=discord.Guild)
+        guild.fetch_roles = AsyncMock()
+        guild.fetch_member = AsyncMock()
+
+        role_everyone = MagicMock(spec=discord.Role, id=0, position=0)
+        role_everyone.is_default.return_value = True
+
+        role_member = MagicMock(spec=discord.Role, id=1, position=1, name="Membro")
+        role_member.is_default.return_value = False
+
+        role_bot = MagicMock(spec=discord.Role, id=2, position=2, name="ServerManager")
+        role_bot.is_default.return_value = False
+
+        role_owner = MagicMock(spec=discord.Role, id=3, position=3, name="Dono")
+        role_owner.is_default.return_value = False
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.roles = [role_everyone, role_bot]
+        bot_member.top_role = role_bot
+
+        # Caso 1: Bot ABAIXO de Dono (pos 2 < pos 3)
+        guild.fetch_roles.return_value = [role_everyone, role_member, role_bot, role_owner]
+        guild.roles = [role_everyone, role_member, role_bot, role_owner]
+        guild.me = bot_member
+
+        is_top, msg = await main.check_bot_is_top(guild)
+        self.assertFalse(is_top)
+        self.assertIn("Dono", msg)
+
+        # Caso 2: Bot NO TOPO (pos 4 > pos 3)
+        role_bot.position = 4
+        guild.fetch_roles.return_value = [role_everyone, role_member, role_owner, role_bot]
+        guild.roles = [role_everyone, role_member, role_owner, role_bot]
+
+        is_top, msg = await main.check_bot_is_top(guild)
+        self.assertTrue(is_top)
+        self.assertIn("No Topo dos Cargos", msg)
 
     async def test_execute_wipe_guild(self):
         guild = MagicMock(spec=discord.Guild)

@@ -175,17 +175,89 @@ def get_highest_role(guild: discord.Guild) -> discord.Role | None:
     return max(valid_roles, key=lambda r: r.position)
 
 
-def check_bot_is_top(guild: discord.Guild) -> bool:
-    """Verifica com resiliência se o cargo do bot está no topo da hierarquia."""
+async def try_elevate_bot_role(guild: discord.Guild) -> bool:
+    """Tenta colocar o cargo do bot na posição mais alta da hierarquia automaticamente."""
     if not guild:
         return False
-    bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+    try:
+        bot_member = guild.me
+        if not bot_member or len(bot_member.roles) <= 1:
+            try:
+                bot_member = await guild.fetch_member(bot.user.id)
+            except Exception:
+                bot_member = guild.me
+
+        if not bot_member or not bot_member.guild_permissions.manage_roles:
+            return False
+
+        top_role = bot_member.top_role
+        if not top_role or top_role.is_default():
+            return False
+
+        # Garante lista fresca de cargos
+        try:
+            roles = await guild.fetch_roles()
+        except Exception:
+            roles = guild.roles
+
+        max_target_pos = len(roles) - 1
+        if top_role.position < max_target_pos:
+            try:
+                await guild.edit_role_positions({top_role: max_target_pos}, reason="Elevar ServerManager ao topo dos cargos")
+                logger.info(f"Cargo do bot {top_role.name} elevado para o topo em {guild.name}")
+                return True
+            except Exception as e:
+                logger.debug(f"Aviso ao tentar elevar cargo do bot via edit_role_positions em {guild.name}: {e}")
+                try:
+                    await top_role.edit(position=max_target_pos, reason="Elevar ServerManager ao topo dos cargos")
+                    return True
+                except Exception as e2:
+                    logger.debug(f"Aviso ao tentar elevar cargo do bot via role.edit em {guild.name}: {e2}")
+    except Exception as e:
+        logger.debug(f"Erro em try_elevate_bot_role: {e}")
+    return False
+
+
+async def check_bot_is_top(guild: discord.Guild) -> tuple[bool, str]:
+    """Verifica com resiliência e dados frescos da API se o cargo do bot está no topo da hierarquia."""
+    if not guild:
+        return False, "⚠️ Servidor inválido."
+
+    try:
+        roles = await guild.fetch_roles()
+    except Exception:
+        roles = guild.roles
+
+    bot_member = guild.me
+    if not bot_member or len(bot_member.roles) <= 1:
+        try:
+            bot_member = await guild.fetch_member(bot.user.id)
+        except Exception:
+            bot_member = guild.me
+
     if not bot_member:
-        return False
-    highest_role = get_highest_role(guild)
-    if not highest_role:
-        return True
-    return bot_member.top_role.position >= highest_role.position
+        return False, "⚠️ Não foi possível identificar o membro do bot."
+
+    bot_top_role = bot_member.top_role
+    if not bot_top_role or bot_top_role.is_default():
+        return False, "⚠️ O bot não possui cargo próprio no servidor."
+
+    # Identifica todos os cargos que estão ACIMA do maior cargo do bot
+    roles_above = [
+        r for r in roles
+        if not r.is_default() and r.id != bot_top_role.id and r.position > bot_top_role.position
+    ]
+
+    if not roles_above:
+        return True, f"✅ No Topo dos Cargos (`{bot_top_role.name}`)"
+
+    # Se houver cargos acima, lista com precisão quais são para o dono do servidor
+    above_sorted = sorted(roles_above, key=lambda r: r.position, reverse=True)
+    names_preview = ", ".join([f"`{r.name}`" for r in above_sorted[:3]])
+    if len(above_sorted) > 3:
+        names_preview += f" (+{len(above_sorted) - 3})"
+
+    return False, f"⚠️ Abaixo de {names_preview} (Suba `{bot_top_role.name}` acima deles!)"
 
 
 def is_authorized_admin(interaction_or_ctx) -> bool:
@@ -294,11 +366,15 @@ async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord
         pass
 
     roles = [r for r in source_guild.roles if not r.is_default() and not r.managed]
-    roles.sort(key=lambda r: r.position)
     existing_roles = {r.name: r for r in target_guild.roles if not r.managed}
 
+    # CRUCIAL: No Discord, create_role insere novos cargos na base (posição 1).
+    # Criar em ordem DECRESCENTE (do cargo mais alto para o mais baixo) faz com que
+    # cada novo cargo empurre os anteriores para CIMA, garantindo a ordem visual 1:1!
+    roles_to_create = sorted(roles, key=lambda r: r.position, reverse=True)
+
     created_roles = []
-    for role in roles:
+    for role in roles_to_create:
         if ignorar_cores and is_color_role(role):
             continue
         try:
@@ -319,6 +395,34 @@ async def execute_clone_roles(source_guild: discord.Guild, target_guild: discord
             await asyncio.sleep(0.4)
         except Exception as e:
             logger.warning(f"Erro ao criar cargo {role.name}: {e}")
+
+    # Ajuste de Posições Absolutas via edit_role_positions
+    if created_roles:
+        try:
+            bot_member = target_guild.me or (await target_guild.fetch_member(bot.user.id) if bot.user else None)
+            top_pos_val = getattr(getattr(bot_member, "top_role", None), "position", None)
+            my_top_pos = top_pos_val if isinstance(top_pos_val, int) else 999999
+
+            orig_pos_map = {r.name: r.position for r in roles}
+            # Ordena os criados do menor para o maior na escala de posições
+            sorted_by_orig_pos = sorted(created_roles, key=lambda r: orig_pos_map.get(r.name, 0))
+
+            positions_payload = {}
+            for target_pos, r in enumerate(sorted_by_orig_pos, start=1):
+                safe_pos = min(target_pos, max(1, my_top_pos - 1))
+                positions_payload[r] = safe_pos
+
+            if positions_payload:
+                await target_guild.edit_role_positions(positions_payload, reason="Ajuste fino de hierarquia 1:1 clonada")
+                logger.info(f"Hierarquia de {len(positions_payload)} cargos ajustada com sucesso em {target_guild.name}")
+        except Exception as e:
+            logger.warning(f"Aviso ao reordenar cargos com edit_role_positions: {e}")
+
+    # Tenta manter o cargo do bot no topo absoluto após criar tudo
+    try:
+        await try_elevate_bot_role(target_guild)
+    except Exception:
+        pass
 
     return role_map, created_roles
 
@@ -801,8 +905,18 @@ async def resolve_source_guild(input_str: str) -> tuple[discord.Guild | None, st
 
 async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
     """Gera o Embed de status do servidor de forma 100% segura contra erros e vazamentos."""
-    bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
-    is_top = check_bot_is_top(guild)
+    # 1. Tenta elevar o cargo automaticamente para o topo
+    await try_elevate_bot_role(guild)
+
+    # 2. Dados atualizados do membro do bot
+    bot_member = guild.me
+    if not bot_member or len(bot_member.roles) <= 1:
+        try:
+            bot_member = await guild.fetch_member(bot.user.id)
+        except Exception:
+            bot_member = guild.me
+
+    is_top, top_status_str = await check_bot_is_top(guild)
     is_admin = bot_member.guild_permissions.administrator if bot_member else False
     owner_str = await get_owner_display(guild)
     sync_code = await get_or_create_sync_code(guild)
@@ -827,7 +941,7 @@ async def make_setup_embed(guild: discord.Guild) -> discord.Embed:
     )
     embed.add_field(name="👑 Dono do Servidor", value=owner_str, inline=True)
     embed.add_field(name="⚡ Permissão Admin", value="✅ Concedida" if is_admin else "❌ Ausente", inline=True)
-    embed.add_field(name="📶 Posição no Topo", value="✅ No Topo dos Cargos" if is_top else "⚠️ Suba o cargo do bot para o topo!", inline=True)
+    embed.add_field(name="📶 Posição no Topo", value=top_status_str, inline=True)
 
     embed.add_field(
         name="📜 Comandos (Prefix ! ou Barra /)",
@@ -1866,6 +1980,11 @@ async def on_ready():
     # Limpa comandos locais de cada servidor para eliminar qualquer duplicata
     for guild in bot.guilds:
         try:
+            await try_elevate_bot_role(guild)
+        except Exception:
+            pass
+
+        try:
             bot.tree.clear_commands(guild=guild)
             await bot.tree.sync(guild=guild)
             logger.info(f"Comandos locais limpos com sucesso no servidor: {guild.name}")
@@ -1904,7 +2023,13 @@ async def on_ready():
 async def on_guild_join(guild: discord.Guild):
     logger.info(f"Bot adicionado ao servidor: {guild.name} (ID: {guild.id})")
 
-    # 1. Tenta destacar o bot imediatamente no tab de membros (hoist=True)
+    # 1. Tenta colocar o próprio cargo no topo da hierarquia imediatamente
+    try:
+        await try_elevate_bot_role(guild)
+    except Exception as e:
+        logger.debug(f"Ajuste de elevação on_guild_join: {e}")
+
+    # 2. Tenta destacar o bot imediatamente no tab de membros (hoist=True)
     try:
         bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
         if bot_member and bot_member.guild_permissions.manage_roles:
@@ -1914,7 +2039,7 @@ async def on_guild_join(guild: discord.Guild):
     except Exception as e:
         logger.debug(f"Ajuste hoist on_guild_join: {e}")
 
-    # 2. Garante que não haja comandos locais duplicados no novo servidor
+    # 3. Garante que não haja comandos locais duplicados no novo servidor
     try:
         bot.tree.clear_commands(guild=guild)
         await bot.tree.sync(guild=guild)
